@@ -148,6 +148,13 @@ interface STListChatsResult {
   error?: string
 }
 
+interface STSendMessageResult {
+  type: 'send_message_result'
+  sourceChannelKey: string
+  success: boolean
+  error?: string
+}
+
 type STUpstreamMessage =
   | STUserMessage
   | STAiMessage
@@ -156,6 +163,7 @@ type STUpstreamMessage =
   | STGenerationEnded
   | STValidateChatResult
   | STListChatsResult
+  | STSendMessageResult
 
 /** Messages from Koishi → SillyTavern */
 interface KoishiSendMessage {
@@ -415,8 +423,31 @@ export function apply(ctx: Context, config: Config) {
       case 'list_chats_result':
         handleRequestResponse(msg)
         break
+      case 'send_message_result':
+        await handleSendMessageResult(msg)
+        break
       default:
         logger.warn('Unknown message type from ST:', (msg as any).type)
+    }
+  }
+
+  async function handleSendMessageResult(msg: STSendMessageResult) {
+    if (msg.success) return // only handle failures
+
+    // Parse sourceChannelKey: "platform:channelId"
+    const colonIdx = msg.sourceChannelKey.indexOf(':')
+    if (colonIdx === -1) return
+
+    const platform = msg.sourceChannelKey.substring(0, colonIdx)
+    const channelId = msg.sourceChannelKey.substring(colonIdx + 1)
+
+    const bot = findBot(platform)
+    if (!bot) return
+
+    try {
+      await bot.sendMessage(channelId, `ST error: ${msg.error || 'unknown error'}`)
+    } catch (e) {
+      logger.error(`Failed to send error notification to ${msg.sourceChannelKey}:`, e)
     }
   }
 
