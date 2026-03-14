@@ -1,0 +1,42 @@
+{
+  "name": "koishi-plugin-sillytavern-bridge",
+  "version": "0.1.0",
+  "description": "Bridge SillyTavern chats to Koishi bot channels via WebSocket",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "koishi-plugin",
+    "sillytavern",
+    "bridge"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "peerDependencies": {
+    "koishi": "^4.15.0"
+  },
+  "devDependencies": {
+    "koishi": "^4.15.0",
+    "typescript": "^5.0.0"
+  },
+  "koishi": {
+    "description": {
+      "en": "Bridge SillyTavern chats to Koishi bot channels via WebSocket",
+      "zh": "通过 WebSocket 将 SillyTavern 聊天桥接到 Koishi 机器人频道"
+    },
+    "service": {
+      "required": [
+        "database",
+        "router"
+      ],
+      "implements": []
+    }
+  }
+}
