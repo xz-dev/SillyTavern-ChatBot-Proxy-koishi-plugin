@@ -553,80 +553,98 @@ export function apply(ctx: Context, config: Config) {
   }
 
   // ----------------------------------------------------------
-  // Channel → ST: Forward channel messages
+  // Channel → ST: Forward channel messages (middleware)
+  // Uses next() callback so commands are consumed first and
+  // only plain text messages reach the forwarding logic.
   // ----------------------------------------------------------
 
-  ctx.on('message', async (session) => {
-    // Ignore bot's own messages
-    if (session.userId === session.selfId) return
+  ctx.middleware(async (session, next) => {
+    return next(async (done) => {
+      // This callback only runs if the message was NOT consumed by a command
+      const pass = () => done?.() as any
 
-    // Look up binding for this channel
-    const [binding] = await ctx.database.get('st_bindings', {
-      platform: session.platform,
-      channelId: session.channelId,
-    })
-    if (!binding) return
+      // Ignore bot's own messages
+      if (session.userId === session.selfId) return pass()
 
-    // No active ST client
-    if (!activeClient || activeClient.readyState !== 1) return
+      // Look up binding for this channel
+      const [binding] = await ctx.database.get('st_bindings', {
+        platform: session.platform,
+        channelId: session.channelId,
+      })
+      if (!binding) return pass()
 
-    // Extract text content
-    const textParts: string[] = []
-    const images: Array<{ name: string; data: string; mimeType: string }> = []
+      // No active ST client — notify user
+      if (!activeClient || activeClient.readyState !== 1) {
+        await session.send('ST client is not connected. Message not forwarded.')
+        return pass()
+      }
 
-    if (session.elements) {
-      for (const el of session.elements) {
-        if (el.type === 'text') {
-          textParts.push(el.attrs?.content || '')
-        } else if (el.type === 'at') {
-          // Include mentions as text
-          textParts.push(`@${el.attrs?.name || el.attrs?.id || ''}`)
-        } else if (el.type === 'image' || el.type === 'img') {
-          const url = el.attrs?.url || el.attrs?.src
-          if (url) {
-            try {
-              const imageData = await fetchUrlAsBase64(url)
-              if (imageData) {
-                images.push(imageData)
+      // Extract text content
+      const textParts: string[] = []
+      const images: Array<{ name: string; data: string; mimeType: string }> = []
+
+      if (session.elements) {
+        for (const el of session.elements) {
+          if (el.type === 'text') {
+            textParts.push(el.attrs?.content || '')
+          } else if (el.type === 'at') {
+            textParts.push(`@${el.attrs?.name || el.attrs?.id || ''}`)
+          } else if (el.type === 'image' || el.type === 'img') {
+            const url = el.attrs?.url || el.attrs?.src
+            if (url) {
+              try {
+                const imageData = await fetchUrlAsBase64(url)
+                if (imageData) {
+                  images.push(imageData)
+                }
+              } catch (e) {
+                logger.warn('Failed to fetch image:', e)
               }
-            } catch (e) {
-              logger.warn('Failed to fetch image:', e)
             }
           }
         }
       }
-    }
 
-    // Fallback to session.content if no elements parsed
-    const text = textParts.join('').trim() || session.content?.trim() || ''
+      // Fallback to session.content if no elements parsed
+      const text = textParts.join('').trim() || session.content?.trim() || ''
 
-    // Skip empty messages with no images
-    if (!text && images.length === 0) return
+      // Skip empty messages with no images
+      if (!text && images.length === 0) return pass()
 
-    const sourceChannelKey = `${session.platform}:${session.channelId}`
-    const senderName = session.username || session.userId || 'Unknown'
+      const sourceChannelKey = `${session.platform}:${session.channelId}`
+      const senderName = session.username || session.userId || 'Unknown'
 
-    // Send text message
-    if (text) {
-      sendToST({
-        type: 'send_message',
-        chatId: binding.stChatId,
-        text,
-        sourceChannelKey,
-        senderName,
-      })
-    }
+      let sent = false
 
-    // Send images as files
-    for (const img of images) {
-      sendToST({
-        type: 'send_file',
-        chatId: binding.stChatId,
-        file: img,
-        sourceChannelKey,
-        senderName,
-      })
-    }
+      // Send text message
+      if (text) {
+        sent = sendToST({
+          type: 'send_message',
+          chatId: binding.stChatId,
+          text,
+          sourceChannelKey,
+          senderName,
+        })
+      }
+
+      // Send images as files
+      for (const img of images) {
+        const ok = sendToST({
+          type: 'send_file',
+          chatId: binding.stChatId,
+          file: img,
+          sourceChannelKey,
+          senderName,
+        })
+        if (ok) sent = true
+      }
+
+      if (!sent && (text || images.length > 0)) {
+        await session.send('Failed to forward message to ST.')
+      }
+
+      return pass()
+    })
   })
 
   // ----------------------------------------------------------
