@@ -1,5 +1,9 @@
 import { Context, Schema, h, Logger } from 'koishi'
-import type { WebSocket } from 'ws'
+import type { IncomingMessage } from 'http'
+import type WebSocket from 'ws'
+import type { RawData } from 'ws'
+// @cordisjs/plugin-server provides ctx.server (Router with .ws() method)
+import '@cordisjs/plugin-server'
 
 export const name = 'sillytavern-bridge'
 export const usage = `
@@ -45,7 +49,7 @@ export const Config: Schema<Config> = Schema.object({
 // ============================================================
 
 export const inject = {
-  required: ['database', 'router'] as const,
+  required: ['database', 'server'] as const,
 }
 
 // ============================================================
@@ -238,7 +242,22 @@ export function apply(ctx: Context, config: Config) {
   // WebSocket Server
   // ----------------------------------------------------------
 
-  ctx.router.ws(config.wsPath, (socket, req) => {
+  /** Clean up a socket: remove all listeners, remove from set, update activeClient */
+  function cleanupSocket(socket: WebSocket) {
+    socket.removeAllListeners()
+    allClients.delete(socket)
+    if (activeClient === socket) {
+      activeClient = allClients.size > 0
+        ? [...allClients][allClients.size - 1]
+        : null
+    }
+    logger.info(`ST client cleaned up. Remaining: ${allClients.size}`)
+    if (allClients.size === 0) {
+      stopPingTimer()
+    }
+  }
+
+  ctx.server.ws(config.wsPath, (socket: WebSocket, req: IncomingMessage) => {
     // Authenticate
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
     const key = url.searchParams.get('key')
@@ -254,34 +273,43 @@ export function apply(ctx: Context, config: Config) {
     logger.info(`ST client connected. Total: ${allClients.size}, using latest.`)
     startPingTimer()
 
-    socket.on('message', (raw) => {
+    const onMessage = (raw: RawData) => {
       try {
         const msg: STUpstreamMessage = JSON.parse(raw.toString())
-        handleSTMessage(msg).catch((e) => {
+        handleSTMessage(msg).catch((e: unknown) => {
           logger.error('Error handling ST message:', e)
         })
       } catch (e) {
         logger.error('Failed to parse ST message:', e)
       }
-    })
+    }
 
-    socket.on('close', () => {
-      allClients.delete(socket)
-      if (activeClient === socket) {
-        // Fall back to the last remaining client, or null
-        activeClient = allClients.size > 0
-          ? [...allClients][allClients.size - 1]
-          : null
-      }
-      logger.info(`ST client disconnected. Remaining: ${allClients.size}`)
-      if (allClients.size === 0) {
-        stopPingTimer()
-      }
-    })
+    const onClose = () => {
+      cleanupSocket(socket)
+    }
 
-    socket.on('error', (err) => {
+    const onError = (err: Error) => {
       logger.error('ST WebSocket error:', err)
-    })
+      // error is always followed by close, so cleanup happens there
+    }
+
+    socket.on('message', onMessage)
+    socket.on('close', onClose)
+    socket.on('error', onError)
+  })
+
+  // When plugin is disposed (hot-reload / unload), close ALL client connections
+  ctx.on('dispose', () => {
+    for (const socket of allClients) {
+      try {
+        socket.close(1001, 'Plugin unloading')
+      } catch {
+        // ignored
+      }
+      cleanupSocket(socket)
+    }
+    allClients.clear()
+    activeClient = null
   })
 
   // ----------------------------------------------------------
@@ -318,7 +346,8 @@ export function apply(ctx: Context, config: Config) {
   // ----------------------------------------------------------
 
   function findBot(platform: string) {
-    return ctx.bots.find(b => b.platform === platform && b.status === 'online')
+    // Status.ONLINE = 1 (const enum from @satorijs/protocol)
+    return ctx.bots.find(b => b.platform === platform && b.status === 1 /* Status.ONLINE */)
   }
 
   async function getBindingsForChat(chatId: string): Promise<STBinding[]> {
