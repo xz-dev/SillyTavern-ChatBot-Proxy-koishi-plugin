@@ -577,9 +577,9 @@ export function apply(ctx: Context, config: Config) {
   // Commands
   // ----------------------------------------------------------
 
-  ctx.command('bind <chatId:string>', 'Bind this channel to a SillyTavern chat')
-    .usage('Usage: bind <chatId>\nGet the chatId from the SillyTavern Koishi Bridge extension settings panel.')
-    .example('bind 2024-3-14_Seraphina@1710400000000')
+  ctx.command('bind <chatId:text>', 'Bind this channel to a SillyTavern chat')
+    .usage('Usage: bind <chatId>\nGet the chatId from the SillyTavern Koishi Bridge extension settings panel.\nThe chat ID may contain spaces — just paste it as-is.')
+    .example('bind Ani - 2026-03-14@18h06m18s170ms')
     .action(async ({ session }, chatId) => {
       if (!chatId) return 'Please provide a SillyTavern chat ID.'
       if (!session) return
