@@ -577,9 +577,13 @@ export function apply(ctx: Context, config: Config) {
   // Commands
   // ----------------------------------------------------------
 
-  ctx.command('bind <chatId:text>', 'Bind this channel to a SillyTavern chat')
-    .usage('Usage: bind <chatId>\nGet the chatId from the SillyTavern Koishi Bridge extension settings panel.\nThe chat ID may contain spaces — just paste it as-is.')
-    .example('bind Ani - 2026-03-14@18h06m18s170ms')
+  // Parent command group
+  ctx.command('st', 'SillyTavern bridge commands')
+
+  ctx.command('st.bind <chatId:text>', 'Bind this channel to a SillyTavern chat')
+    .alias('st-bind')
+    .usage('Usage: st.bind <chatId>\nGet the chatId from the SillyTavern Koishi Bridge extension settings panel.\nThe chat ID may contain spaces — just paste it as-is.')
+    .example('st.bind Ani - 2026-03-14@18h06m18s170ms')
     .action(async ({ session }, chatId) => {
       if (!chatId) return 'Please provide a SillyTavern chat ID.'
       if (!session) return
@@ -600,7 +604,8 @@ export function apply(ctx: Context, config: Config) {
       ].join('\n')
     })
 
-  ctx.command('unbind', 'Unbind this channel from SillyTavern')
+  ctx.command('st.unbind', 'Unbind this channel from SillyTavern')
+    .alias('st-unbind')
     .action(async ({ session }) => {
       if (!session) return
 
@@ -615,7 +620,8 @@ export function apply(ctx: Context, config: Config) {
       return 'Unbound from SillyTavern chat.'
     })
 
-  ctx.command('status', 'Show SillyTavern bridge status')
+  ctx.command('st.status', 'Show SillyTavern bridge status')
+    .alias('st-status')
     .action(async ({ session }) => {
       if (!session) return
 
