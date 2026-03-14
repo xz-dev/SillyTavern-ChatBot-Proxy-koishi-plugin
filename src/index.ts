@@ -356,7 +356,10 @@ export function apply(ctx: Context, config: Config) {
 
   async function broadcastUserMessage(msg: STUserMessage) {
     const bindings = await getBindingsForChat(msg.chatId)
-    if (!bindings.length) return
+    if (!bindings.length) {
+      logger.debug('No bindings found for chatId:', msg.chatId)
+      return
+    }
 
     for (const binding of bindings) {
       const channelKey = `${binding.platform}:${binding.channelId}`
@@ -365,7 +368,10 @@ export function apply(ctx: Context, config: Config) {
       if (msg.sourceChannelKey === channelKey) continue
 
       const bot = findBot(binding.platform)
-      if (!bot) continue
+      if (!bot) {
+        logger.debug(`No online bot found for platform "${binding.platform}", available: [${ctx.bots.map(b => `${b.platform}(${b.status})`).join(', ')}]`)
+        continue
+      }
 
       try {
         // Build message content
