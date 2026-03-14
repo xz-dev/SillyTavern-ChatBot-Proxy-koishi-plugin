@@ -22,7 +22,6 @@ export interface Config {
   apiKey: string
   userMessagePrefix: string
   aiMessagePrefix: string
-  maxPayloadSize: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -39,9 +38,6 @@ export const Config: Schema<Config> = Schema.object({
   aiMessagePrefix: Schema.string()
     .default('')
     .description('Prefix for AI messages broadcast to channels (e.g. "🤖 ")'),
-  maxPayloadSize: Schema.number()
-    .default(50)
-    .description('Maximum WebSocket payload size in MB'),
 })
 
 // ============================================================
@@ -242,9 +238,7 @@ export function apply(ctx: Context, config: Config) {
   // WebSocket Server
   // ----------------------------------------------------------
 
-  ctx.router.ws(config.wsPath, {
-    maxPayload: config.maxPayloadSize * 1024 * 1024,
-  }, (socket, req) => {
+  ctx.router.ws(config.wsPath, (socket, req) => {
     // Authenticate
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
     const key = url.searchParams.get('key')
