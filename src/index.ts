@@ -122,6 +122,26 @@ interface STGenerationEnded {
   chatId: string
 }
 
+interface STValidateChatResult {
+  type: 'validate_chat_result'
+  requestId: string
+  valid: boolean
+  chatId: string
+  error?: string | null
+}
+
+interface STListChatsResult {
+  type: 'list_chats_result'
+  requestId: string
+  chats: Array<{
+    chatId: string
+    characterName: string
+    messageCount: number
+    lastMessage: string
+  }>
+  error?: string
+}
+
 interface STPong {
   type: 'pong'
 }
@@ -132,6 +152,8 @@ type STUpstreamMessage =
   | STAiTts
   | STGenerationStarted
   | STGenerationEnded
+  | STValidateChatResult
+  | STListChatsResult
   | STPong
 
 /** Messages from Koishi → SillyTavern */
@@ -155,11 +177,22 @@ interface KoishiSendFile {
   senderName: string
 }
 
+interface KoishiValidateChat {
+  type: 'validate_chat'
+  requestId: string
+  chatId: string
+}
+
+interface KoishiListChats {
+  type: 'list_chats'
+  requestId: string
+}
+
 interface KoishiPing {
   type: 'ping'
 }
 
-type KoishiDownstreamMessage = KoishiSendMessage | KoishiSendFile | KoishiPing
+type KoishiDownstreamMessage = KoishiSendMessage | KoishiSendFile | KoishiValidateChat | KoishiListChats | KoishiPing
 
 // ============================================================
 // Plugin Entry
@@ -204,6 +237,40 @@ export function apply(ctx: Context, config: Config) {
     } catch (e) {
       logger.error('Failed to send to ST client:', e)
       return false
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Request/Response for validate_chat and list_chats
+  // ----------------------------------------------------------
+
+  let requestCounter = 0
+  const pendingRequests = new Map<string, { resolve: (value: any) => void, timer: ReturnType<typeof setTimeout> }>()
+
+  function generateRequestId(): string {
+    return `req_${++requestCounter}_${Date.now()}`
+  }
+
+  /** Send a request to ST and wait for the response (with timeout) */
+  function requestST<T>(msg: KoishiDownstreamMessage, timeoutMs = 15000): Promise<T | null> {
+    const requestId = (msg as any).requestId as string
+    if (!sendToST(msg)) return Promise.resolve(null)
+
+    return new Promise<T | null>((resolve) => {
+      const timer = setTimeout(() => {
+        pendingRequests.delete(requestId)
+        resolve(null)
+      }, timeoutMs)
+      pendingRequests.set(requestId, { resolve, timer })
+    })
+  }
+
+  function handleRequestResponse(msg: STValidateChatResult | STListChatsResult) {
+    const pending = pendingRequests.get(msg.requestId)
+    if (pending) {
+      clearTimeout(pending.timer)
+      pendingRequests.delete(msg.requestId)
+      pending.resolve(msg)
     }
   }
 
@@ -332,6 +399,10 @@ export function apply(ctx: Context, config: Config) {
         break
       case 'generation_ended':
         await setTypingStatus(msg.chatId, false)
+        break
+      case 'validate_chat_result':
+      case 'list_chats_result':
+        handleRequestResponse(msg)
         break
       case 'pong':
         // heartbeat response, nothing to do
@@ -588,11 +659,30 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.command('st.bind <chatId:text>', 'Bind this channel to a SillyTavern chat')
     .alias('st-bind')
-    .usage('Usage: st.bind <chatId>\nGet the chatId from the SillyTavern Koishi Bridge extension settings panel.\nThe chat ID may contain spaces — just paste it as-is.')
+    .usage('Usage: st.bind <chatId>\nGet the chatId from st.list or the SillyTavern extension settings panel.')
     .example('st.bind Ani - 2026-03-14@18h06m18s170ms')
     .action(async ({ session }, chatId) => {
       if (!chatId) return 'Please provide a SillyTavern chat ID.'
       if (!session) return
+
+      // Validate chatId with ST client
+      if (!activeClient || activeClient.readyState !== 1) {
+        return 'ST client is not connected. Cannot validate chat ID.'
+      }
+
+      const reqId = generateRequestId()
+      const result = await requestST<STValidateChatResult>({
+        type: 'validate_chat',
+        requestId: reqId,
+        chatId,
+      })
+
+      if (!result) {
+        return 'ST client did not respond (timeout). Is the browser tab open?'
+      }
+      if (!result.valid) {
+        return `Invalid chat ID: ${result.error || 'not found'}`
+      }
 
       await ctx.database.upsert('st_bindings', [{
         platform: session.platform,
@@ -603,11 +693,7 @@ export function apply(ctx: Context, config: Config) {
         createdBy: session.userId,
       }], ['platform', 'channelId'])
 
-      const stConnected = activeClient?.readyState === 1
-      return [
-        `Bound to SillyTavern chat: ${chatId}`,
-        `ST connection: ${stConnected ? 'online' : 'offline'}`,
-      ].join('\n')
+      return `Bound to SillyTavern chat: ${chatId}`
     })
 
   ctx.command('st.unbind', 'Unbind this channel from SillyTavern')
@@ -624,6 +710,35 @@ export function apply(ctx: Context, config: Config) {
         return 'This channel is not bound to any SillyTavern chat.'
       }
       return 'Unbound from SillyTavern chat.'
+    })
+
+  ctx.command('st.list', 'List all SillyTavern chats')
+    .alias('st-list')
+    .action(async () => {
+      if (!activeClient || activeClient.readyState !== 1) {
+        return 'ST client is not connected.'
+      }
+
+      const reqId = generateRequestId()
+      const result = await requestST<STListChatsResult>({
+        type: 'list_chats',
+        requestId: reqId,
+      })
+
+      if (!result) {
+        return 'ST client did not respond (timeout).'
+      }
+      if (result.error) {
+        return `Error: ${result.error}`
+      }
+      if (!result.chats.length) {
+        return 'No chats found.'
+      }
+
+      const lines = result.chats.map((chat, i) =>
+        `${i + 1}. [${chat.characterName}] ${chat.chatId} (${chat.messageCount} msgs)`
+      )
+      return lines.join('\n')
     })
 
   ctx.command('st.status', 'Show SillyTavern bridge status')
