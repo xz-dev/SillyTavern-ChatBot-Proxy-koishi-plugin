@@ -7,6 +7,7 @@ export interface Config {
     apiKey: string;
     userMessagePrefix: string;
     aiMessagePrefix: string;
+    pingInterval: number;
 }
 export declare const Config: Schema<Config>;
 export declare const inject: {

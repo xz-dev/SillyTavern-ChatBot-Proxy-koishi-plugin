@@ -26,6 +26,7 @@ export interface Config {
   apiKey: string
   userMessagePrefix: string
   aiMessagePrefix: string
+  pingInterval: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -42,6 +43,11 @@ export const Config: Schema<Config> = Schema.object({
   aiMessagePrefix: Schema.string()
     .default('')
     .description('Prefix for AI messages broadcast to channels (e.g. "🤖 ")'),
+  pingInterval: Schema.number()
+    .default(10)
+    .min(1)
+    .max(300)
+    .description('WebSocket ping interval in seconds (RFC 6455 protocol-level ping)'),
 })
 
 // ============================================================
@@ -142,10 +148,6 @@ interface STListChatsResult {
   error?: string
 }
 
-interface STPong {
-  type: 'pong'
-}
-
 type STUpstreamMessage =
   | STUserMessage
   | STAiMessage
@@ -154,7 +156,6 @@ type STUpstreamMessage =
   | STGenerationEnded
   | STValidateChatResult
   | STListChatsResult
-  | STPong
 
 /** Messages from Koishi → SillyTavern */
 interface KoishiSendMessage {
@@ -188,11 +189,7 @@ interface KoishiListChats {
   requestId: string
 }
 
-interface KoishiPing {
-  type: 'ping'
-}
-
-type KoishiDownstreamMessage = KoishiSendMessage | KoishiSendFile | KoishiValidateChat | KoishiListChats | KoishiPing
+type KoishiDownstreamMessage = KoishiSendMessage | KoishiSendFile | KoishiValidateChat | KoishiListChats
 
 // ============================================================
 // Plugin Entry
@@ -275,25 +272,31 @@ export function apply(ctx: Context, config: Config) {
   }
 
   // ----------------------------------------------------------
-  // Heartbeat
+  // Heartbeat (RFC 6455 protocol-level ping/pong)
   // ----------------------------------------------------------
 
-  const PING_INTERVAL = 30_000
+  const clientAlive = new Map<WebSocket, boolean>()
   let pingTimer: ReturnType<typeof setInterval> | null = null
 
   function startPingTimer() {
-    if (pingTimer) return
+    stopPingTimer()
     pingTimer = setInterval(() => {
       for (const client of allClients) {
-        if (client.readyState === 1) {
-          try {
-            client.send(JSON.stringify({ type: 'ping' } satisfies KoishiPing))
-          } catch {
-            // will be handled by close event
-          }
+        if (clientAlive.get(client) === false) {
+          // Previous ping got no pong — dead connection
+          logger.warn('ST client failed pong check, terminating')
+          client.terminate()
+          cleanupSocket(client)
+          continue
+        }
+        clientAlive.set(client, false)
+        try {
+          client.ping() // RFC 6455 protocol-level ping
+        } catch {
+          // will be handled by close event
         }
       }
-    }, PING_INTERVAL)
+    }, config.pingInterval * 1000)
   }
 
   function stopPingTimer() {
@@ -313,6 +316,7 @@ export function apply(ctx: Context, config: Config) {
   function cleanupSocket(socket: WebSocket) {
     socket.removeAllListeners()
     allClients.delete(socket)
+    clientAlive.delete(socket)
     if (activeClient === socket) {
       activeClient = allClients.size > 0
         ? [...allClients][allClients.size - 1]
@@ -336,9 +340,15 @@ export function apply(ctx: Context, config: Config) {
 
     // Register client
     allClients.add(socket)
+    clientAlive.set(socket, true)
     activeClient = socket
     logger.info(`ST client connected. Total: ${allClients.size}, using latest.`)
     startPingTimer()
+
+    // RFC 6455: browser auto-replies pong to our ping
+    socket.on('pong', () => {
+      clientAlive.set(socket, true)
+    })
 
     const onMessage = (raw: RawData) => {
       try {
@@ -376,6 +386,7 @@ export function apply(ctx: Context, config: Config) {
       cleanupSocket(socket)
     }
     allClients.clear()
+    clientAlive.clear()
     activeClient = null
   })
 
@@ -403,9 +414,6 @@ export function apply(ctx: Context, config: Config) {
       case 'validate_chat_result':
       case 'list_chats_result':
         handleRequestResponse(msg)
-        break
-      case 'pong':
-        // heartbeat response, nothing to do
         break
       default:
         logger.warn('Unknown message type from ST:', (msg as any).type)
@@ -775,6 +783,36 @@ export function apply(ctx: Context, config: Config) {
         `Binding: ${binding ? binding.stChatId : 'not bound'}`,
         `ST connection: ${stConnected ? 'online' : 'offline'}`,
         `ST clients: ${allClients.size}`,
+        `Ping interval: ${config.pingInterval}s`,
       ].join('\n')
+    })
+
+  ctx.command('st.config <key:string> [value:string]', 'View or update bridge configuration')
+    .alias('st-config')
+    .usage('Usage: st.config ping <seconds>\nExample: st.config ping 5')
+    .action(async (_, key, value) => {
+      if (!key) {
+        return `Current config:\n  ping: ${config.pingInterval}s`
+      }
+
+      if (key === 'ping') {
+        if (!value) {
+          return `ping: ${config.pingInterval}s`
+        }
+        const seconds = parseInt(value, 10)
+        if (isNaN(seconds) || seconds < 1 || seconds > 300) {
+          return 'Invalid value. ping must be 1-300 seconds.'
+        }
+        config.pingInterval = seconds
+        // Restart ping timer with new interval
+        if (allClients.size > 0) {
+          startPingTimer()
+        }
+        // Persist to koishi.yml via ctx.scope
+        ctx.scope.update(config)
+        return `Ping interval set to ${seconds}s (saved)`
+      }
+
+      return `Unknown config key: ${key}\nAvailable keys: ping`
     })
 }
