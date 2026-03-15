@@ -457,11 +457,8 @@ export function apply(ctx: Context, config: Config) {
     const platform = msg.sourceChannelKey.substring(0, colonIdx)
     const channelId = msg.sourceChannelKey.substring(colonIdx + 1)
 
-    const bot = findBot(platform)
-    if (!bot) return
-
     try {
-      await bot.sendMessage(channelId, `ST error: ${msg.error || 'unknown error'}\nUse st.retry to retry.`)
+      await sendToChannel(platform, channelId, `ST error: ${msg.error || 'unknown error'}\nUse st.retry to retry.`)
     } catch (e) {
       logger.error(`Failed to send error notification to ${msg.sourceChannelKey}:`, e)
     }
@@ -474,6 +471,14 @@ export function apply(ctx: Context, config: Config) {
   function findBot(platform: string) {
     // Status.ONLINE = 1 (const enum from @satorijs/protocol)
     return ctx.bots.find(b => b.platform === platform && b.status === 1 /* Status.ONLINE */)
+  }
+
+  /** Send a message to a channel, releasing any typing lock first */
+  async function sendToChannel(platform: string, channelId: string, content: string) {
+    stopTyping(`${platform}:${channelId}`)
+    const bot = findBot(platform)
+    if (!bot) return
+    await bot.sendMessage(channelId, content)
   }
 
   // ----------------------------------------------------------
@@ -572,12 +577,6 @@ export function apply(ctx: Context, config: Config) {
       // Skip the originating channel
       if (msg.sourceChannelKey === channelKey) continue
 
-      const bot = findBot(binding.platform)
-      if (!bot) {
-        logger.debug(`No online bot found for platform "${binding.platform}", available: [${ctx.bots.map(b => `${b.platform}(${b.status})`).join(', ')}]`)
-        continue
-      }
-
       try {
         // Build message content
         const parts: string[] = []
@@ -606,7 +605,7 @@ export function apply(ctx: Context, config: Config) {
         }
 
         if (parts.length > 0) {
-          await bot.sendMessage(binding.channelId, parts.join('\n'))
+          await sendToChannel(binding.platform, binding.channelId, parts.join('\n'))
         }
       } catch (e) {
         logger.error(`Failed to broadcast user message to ${channelKey}:`, e)
@@ -619,9 +618,6 @@ export function apply(ctx: Context, config: Config) {
     if (!bindings.length) return
 
     for (const binding of bindings) {
-      const bot = findBot(binding.platform)
-      if (!bot) continue
-
       try {
         const parts: string[] = []
 
@@ -638,7 +634,7 @@ export function apply(ctx: Context, config: Config) {
         }
 
         if (parts.length > 0) {
-          await bot.sendMessage(binding.channelId, parts.join('\n'))
+          await sendToChannel(binding.platform, binding.channelId, parts.join('\n'))
         }
       } catch (e) {
         const channelKey = `${binding.platform}:${binding.channelId}`
@@ -654,11 +650,9 @@ export function apply(ctx: Context, config: Config) {
     const audioUrl = `data:${msg.mimeType};base64,${msg.audio}`
 
     for (const binding of bindings) {
-      const bot = findBot(binding.platform)
-      if (!bot) continue
 
       try {
-        await bot.sendMessage(binding.channelId, h('audio', { url: audioUrl }).toString())
+        await sendToChannel(binding.platform, binding.channelId, h('audio', { url: audioUrl }).toString())
       } catch (e) {
         const channelKey = `${binding.platform}:${binding.channelId}`
         logger.error(`Failed to broadcast TTS to ${channelKey}:`, e)
