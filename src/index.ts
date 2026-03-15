@@ -505,7 +505,6 @@ export function apply(ctx: Context, config: Config) {
     }
 
     const imageBuffer = Buffer.from(result.avatar, 'base64')
-    logger.info(`Avatar received: ${imageBuffer.length} bytes, mimeType: ${result.mimeType}`)
 
     // Set avatar for all bots that have bindings to this chatId
     const bindings = await ctx.database.get('st_bindings', { stChatId: chatId })
@@ -540,9 +539,7 @@ export function apply(ctx: Context, config: Config) {
             headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
             body,
           })
-          const respText = await resp.text()
-          logger.info(`Telegram setMyProfilePhoto response: ${respText}`)
-          const respJson = JSON.parse(respText) as any
+          const respJson = await resp.json() as any
           if (respJson.ok) {
             logger.info(`Telegram bot avatar updated for character: ${charName}`)
           } else {
@@ -817,41 +814,34 @@ export function apply(ctx: Context, config: Config) {
         return pass()
       }
 
-      // Extract text content, images, and audio
+      // Extract text, images, and audio from message elements
       const textParts: string[] = []
       const images: Array<{ name: string; data: string; mimeType: string }> = []
       const audioFiles: Array<{ name: string; data: string; mimeType: string }> = []
 
       if (session.elements) {
         for (const el of session.elements) {
-          if (el.type === 'text') {
-            textParts.push(el.attrs?.content || '')
-          } else if (el.type === 'at') {
-            textParts.push(`@${el.attrs?.name || el.attrs?.id || ''}`)
-          } else if (el.type === 'image' || el.type === 'img') {
-            const url = el.attrs?.url || el.attrs?.src
-            if (url) {
-              try {
-                const imageData = await fetchUrlAsBase64(url)
-                if (imageData) {
-                  images.push(imageData)
-                }
-              } catch (e) {
-                logger.warn('Failed to fetch image:', e)
+          const src = el.attrs?.src || el.attrs?.url
+          switch (el.type) {
+            case 'text':
+              textParts.push(el.attrs?.content || '')
+              break
+            case 'at':
+              textParts.push(`@${el.attrs?.name || el.attrs?.id || ''}`)
+              break
+            case 'image':
+            case 'img':
+              if (src) {
+                const data = await downloadToBase64(src, 'image/jpeg')
+                if (data) images.push(data)
               }
-            }
-          } else if (el.type === 'audio' || el.type === 'record' || el.type === 'voice') {
-            const url = el.attrs?.url || el.attrs?.src
-            if (url) {
-              try {
-                const audioData = await fetchUrlAsBase64(url)
-                if (audioData) {
-                  audioFiles.push(audioData)
-                }
-              } catch (e) {
-                logger.warn('Failed to fetch audio:', e)
+              break
+            case 'audio':
+              if (src) {
+                const data = await downloadToBase64(src, 'audio/ogg')
+                if (data) audioFiles.push(data)
               }
-            }
+              break
           }
         }
       }
@@ -923,19 +913,28 @@ export function apply(ctx: Context, config: Config) {
   // Helper: Fetch URL content as base64
   // ----------------------------------------------------------
 
-  async function fetchUrlAsBase64(url: string): Promise<{ name: string; data: string; mimeType: string } | null> {
+  /** Download a URL to base64 using ctx.http (handles Satori internal URLs) */
+  async function downloadToBase64(url: string, defaultMimeType = 'application/octet-stream'): Promise<{ name: string; data: string; mimeType: string } | null> {
     try {
-      const response = await fetch(url)
-      if (!response.ok) return null
-      const buffer = Buffer.from(await response.arrayBuffer())
-      const mimeType = response.headers.get('content-type') || 'application/octet-stream'
-      const ext = mimeType.split('/')[1]?.split(';')[0] || 'bin'
+      const buffer = Buffer.from(
+        await ctx.http.get(url, { responseType: 'arraybuffer' })
+      )
+      if (!buffer.length) return null
+      // Infer mime type from URL extension as fallback
+      const ext = url.split('.').pop()?.split('?')[0] || 'bin'
+      const mimeMap: Record<string, string> = {
+        jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
+        ogg: 'audio/ogg', oga: 'audio/ogg', mp3: 'audio/mpeg', wav: 'audio/wav', webm: 'audio/webm',
+        pdf: 'application/pdf', txt: 'text/plain',
+      }
+      const mimeType = mimeMap[ext] || defaultMimeType
       return {
-        name: `image.${ext}`,
+        name: `file.${ext}`,
         data: buffer.toString('base64'),
         mimeType,
       }
-    } catch {
+    } catch (e) {
+      logger.warn(`Failed to download ${url}:`, e)
       return null
     }
   }
