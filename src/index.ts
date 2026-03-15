@@ -837,8 +837,20 @@ export function apply(ctx: Context, config: Config) {
               }
               break
             case 'audio':
+            case 'voice':
+            case 'record':
               if (src) {
-                const data = await downloadToBase64(src, 'audio/ogg')
+                let data = null
+                if (src.startsWith('http://') || src.startsWith('https://')) {
+                  data = await downloadToBase64(src, 'audio/ogg')
+                } else if (session.platform === 'telegram') {
+                  const token = (session.bot.config as any)?.token
+                  if (token) {
+                    const filePath = src.startsWith('/') ? src.substring(1) : src
+                    const downloadUrl = `https://api.telegram.org/file/bot${token}/${filePath}`
+                    data = await downloadToBase64(downloadUrl, 'audio/ogg')
+                  }
+                }
                 if (data) audioFiles.push(data)
               }
               break
