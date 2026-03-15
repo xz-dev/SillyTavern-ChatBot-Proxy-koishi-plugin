@@ -701,7 +701,10 @@ export function apply(ctx: Context, config: Config) {
         if (ok) sent = true
       }
 
-      if (!sent && (text || images.length > 0)) {
+      if (sent) {
+        // New message sent successfully — clear stale failed message for this channel
+        lastFailedMessage.delete(sourceChannelKey)
+      } else if (text || images.length > 0) {
         await session.send('Failed to forward message to ST.')
       }
 
