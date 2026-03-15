@@ -432,20 +432,29 @@ export function apply(ctx: Context, config: Config) {
   }
 
   async function handleSendMessageResult(msg: STSendMessageResult) {
+    logger.info(`Received send_message_result: success=${msg.success}, sourceChannelKey=${msg.sourceChannelKey}, error=${msg.error}`)
+
     if (msg.success) return // only handle failures
 
     // Parse sourceChannelKey: "platform:channelId"
     const colonIdx = msg.sourceChannelKey.indexOf(':')
-    if (colonIdx === -1) return
+    if (colonIdx === -1) {
+      logger.warn('Invalid sourceChannelKey format:', msg.sourceChannelKey)
+      return
+    }
 
     const platform = msg.sourceChannelKey.substring(0, colonIdx)
     const channelId = msg.sourceChannelKey.substring(colonIdx + 1)
 
     const bot = findBot(platform)
-    if (!bot) return
+    if (!bot) {
+      logger.warn(`No online bot for platform "${platform}", available: [${ctx.bots.map(b => `${b.platform}(${b.status})`).join(', ')}]`)
+      return
+    }
 
     try {
       await bot.sendMessage(channelId, `ST error: ${msg.error || 'unknown error'}`)
+      logger.info(`Error notification sent to ${msg.sourceChannelKey}`)
     } catch (e) {
       logger.error(`Failed to send error notification to ${msg.sourceChannelKey}:`, e)
     }
