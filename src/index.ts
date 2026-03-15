@@ -658,9 +658,10 @@ export function apply(ctx: Context, config: Config) {
         if (binding.platform === 'telegram') {
           // Use Telegram native sendVoice via FormData (same pattern as adapter's sendPhoto)
           const audioBuffer = Buffer.from(msg.audio, 'base64')
+          const ext = msg.mimeType === 'audio/mpeg' ? 'mp3' : 'ogg'
           const formData = new FormData()
           formData.append('chat_id', binding.channelId)
-          formData.append('voice', new Blob([audioBuffer], { type: 'audio/ogg' }), 'voice.ogg')
+          formData.append('voice', new Blob([audioBuffer], { type: msg.mimeType }), `voice.${ext}`)
           await (bot as any).internal.sendVoice(formData)
         } else {
           // Fallback for other platforms: generic audio element
