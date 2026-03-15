@@ -505,6 +505,7 @@ export function apply(ctx: Context, config: Config) {
     }
 
     const imageBuffer = Buffer.from(result.avatar, 'base64')
+    logger.info(`Avatar received: ${imageBuffer.length} bytes, mimeType: ${result.mimeType}`)
 
     // Set avatar for all bots that have bindings to this chatId
     const bindings = await ctx.database.get('st_bindings', { stChatId: chatId })
@@ -539,7 +540,9 @@ export function apply(ctx: Context, config: Config) {
             headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
             body,
           })
-          const respJson = await resp.json() as any
+          const respText = await resp.text()
+          logger.info(`Telegram setMyProfilePhoto response: ${respText}`)
+          const respJson = JSON.parse(respText) as any
           if (respJson.ok) {
             logger.info(`Telegram bot avatar updated for character: ${charName}`)
           } else {
