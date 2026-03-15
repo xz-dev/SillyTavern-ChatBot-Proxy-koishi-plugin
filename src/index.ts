@@ -819,8 +819,14 @@ export function apply(ctx: Context, config: Config) {
       const images: Array<{ name: string; data: string; mimeType: string }> = []
       const audioFiles: Array<{ name: string; data: string; mimeType: string }> = []
 
-      // Debug: log all elements
-      logger.info(`Message elements: ${JSON.stringify(session.elements?.map(e => ({ type: e.type, attrs: e.attrs })))}`)
+      // Debug: log elements and raw event keys for audio messages
+      const hasAudio = session.elements?.some(e => e.type === 'audio')
+      if (hasAudio) {
+        logger.info(`Audio message elements: ${JSON.stringify(session.elements?.map(e => ({ type: e.type, attrs: e.attrs })))}`)
+        logger.info(`session.event keys: ${JSON.stringify(Object.keys(session.event || {}))}`)
+        logger.info(`session.event._data keys: ${JSON.stringify(Object.keys((session.event as any)?._data || {}))}`)
+        logger.info(`session.event._data: ${JSON.stringify((session.event as any)?._data).substring(0, 500)}`)
+      }
 
       if (session.elements) {
         for (const el of session.elements) {
@@ -841,22 +847,32 @@ export function apply(ctx: Context, config: Config) {
               break
             case 'audio':
             case 'voice':
-            case 'record':
-              if (src) {
-                let data = null
-                if (src.startsWith('http://') || src.startsWith('https://')) {
-                  data = await downloadToBase64(src, 'audio/ogg')
-                } else if (session.platform === 'telegram') {
-                  const token = (session.bot.config as any)?.token
-                  if (token) {
-                    const filePath = src.startsWith('/') ? src.substring(1) : src
-                    const downloadUrl = `https://api.telegram.org/file/bot${token}/${filePath}`
-                    data = await downloadToBase64(downloadUrl, 'audio/ogg')
+            case 'record': {
+              let data = null
+              if (src && (src.startsWith('http://') || src.startsWith('https://'))) {
+                data = await downloadToBase64(src, 'audio/ogg')
+              } else if (session.platform === 'telegram') {
+                // Adapter failed to resolve file URL (missing selfUrl config)
+                // Fall back to Telegram Bot API: extract file_id from raw event
+                const token = (session.bot.config as any)?.token
+                const rawEvent = (session.event as any)?._data || (session.event as any)?.telegram || (session.event as any)
+                const fileId = rawEvent?.voice?.file_id || rawEvent?.audio?.file_id || rawEvent?.message?.voice?.file_id || rawEvent?.message?.audio?.file_id
+                if (token && fileId) {
+                  try {
+                    const fileResp = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`)
+                    const fileJson = await fileResp.json() as any
+                    if (fileJson.ok && fileJson.result?.file_path) {
+                      const downloadUrl = `https://api.telegram.org/file/bot${token}/${fileJson.result.file_path}`
+                      data = await downloadToBase64(downloadUrl, 'audio/ogg')
+                    }
+                  } catch (e) {
+                    logger.warn('Failed to download Telegram voice via API:', e)
                   }
                 }
-                if (data) audioFiles.push(data)
               }
+              if (data) audioFiles.push(data)
               break
+            }
           }
         }
       }
