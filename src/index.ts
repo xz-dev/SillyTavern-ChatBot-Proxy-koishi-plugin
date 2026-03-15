@@ -814,6 +814,9 @@ export function apply(ctx: Context, config: Config) {
         return pass()
       }
 
+      // Start typing immediately — content extraction (downloading images/audio) may take time
+      startTyping(session)
+
       // Extract text, images, and audio from message elements
       const textParts: string[] = []
       const images: Array<{ name: string; data: string; mimeType: string }> = []
@@ -882,13 +885,13 @@ export function apply(ctx: Context, config: Config) {
       const text = textParts.join('').trim() || session.content?.trim() || ''
 
       // Skip empty messages with no media
-      if (!text && images.length === 0 && audioFiles.length === 0) return pass()
+      if (!text && images.length === 0 && audioFiles.length === 0) {
+        stopTyping(`${session.platform}:${session.channelId}`)
+        return pass()
+      }
 
       const sourceChannelKey = `${session.platform}:${session.channelId}`
       const senderName = session.username || session.userId || 'Unknown'
-
-      // Start typing — will be stopped by generation_ended / ai_message / send_message_result
-      startTyping(session)
 
       let sent = false
 
