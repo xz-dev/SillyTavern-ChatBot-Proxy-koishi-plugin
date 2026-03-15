@@ -854,9 +854,10 @@ export function apply(ctx: Context, config: Config) {
               } else if (session.platform === 'telegram') {
                 // Adapter failed to resolve file URL (missing selfUrl config)
                 // Fall back to Telegram Bot API: extract file_id from raw event
-                const token = (session.bot.config as any)?.token
-                const rawEvent = (session.event as any)?._data || (session.event as any)?.telegram || (session.event as any)
-                const fileId = rawEvent?.voice?.file_id || rawEvent?.audio?.file_id || rawEvent?.message?.voice?.file_id || rawEvent?.message?.audio?.file_id
+                const token = (session.bot.config as any)?.token || (session.bot as any).config?.token
+                const rawEvent = (session.event as any)?._data
+                const fileId = rawEvent?.message?.voice?.file_id || rawEvent?.message?.audio?.file_id || rawEvent?.voice?.file_id || rawEvent?.audio?.file_id
+                logger.info(`Telegram voice fallback: token=${!!token}, fileId=${fileId?.substring(0, 20)}...`)
                 if (token && fileId) {
                   try {
                     const fileResp = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`)
