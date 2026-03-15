@@ -819,15 +819,6 @@ export function apply(ctx: Context, config: Config) {
       const images: Array<{ name: string; data: string; mimeType: string }> = []
       const audioFiles: Array<{ name: string; data: string; mimeType: string }> = []
 
-      // Debug: log elements and raw event keys for audio messages
-      const hasAudio = session.elements?.some(e => e.type === 'audio')
-      if (hasAudio) {
-        logger.info(`Audio message elements: ${JSON.stringify(session.elements?.map(e => ({ type: e.type, attrs: e.attrs })))}`)
-        logger.info(`session.event keys: ${JSON.stringify(Object.keys(session.event || {}))}`)
-        logger.info(`session.event._data keys: ${JSON.stringify(Object.keys((session.event as any)?._data || {}))}`)
-        logger.info(`session.event._data: ${JSON.stringify((session.event as any)?._data).substring(0, 500)}`)
-      }
-
       if (session.elements) {
         for (const el of session.elements) {
           const src = el.attrs?.src || el.attrs?.url
@@ -857,20 +848,15 @@ export function apply(ctx: Context, config: Config) {
                 const token = (session.bot.config as any)?.token || (session.bot as any).config?.token
                 const rawEvent = (session.event as any)?._data
                 const fileId = rawEvent?.message?.voice?.file_id || rawEvent?.message?.audio?.file_id || rawEvent?.voice?.file_id || rawEvent?.audio?.file_id
-                logger.info(`Telegram voice fallback: token=${!!token}, fileId=${fileId?.substring(0, 20)}...`)
                 if (token && fileId) {
                   try {
-                    logger.info('Calling Telegram getFile API...')
                     const fileResp = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`)
                     const fileJson = await fileResp.json() as any
-                    logger.info(`getFile response: ok=${fileJson.ok}, file_path=${fileJson.result?.file_path}`)
                     if (fileJson.ok && fileJson.result?.file_path) {
                       const downloadUrl = `https://api.telegram.org/file/bot${token}/${fileJson.result.file_path}`
-                      logger.info(`Downloading voice from: ${downloadUrl}`)
                       const resp = await fetch(downloadUrl)
                       if (resp.ok) {
                         const buffer = Buffer.from(await resp.arrayBuffer())
-                        logger.info(`Voice downloaded: ${buffer.length} bytes`)
                         data = {
                           name: 'voice.ogg',
                           data: buffer.toString('base64'),
