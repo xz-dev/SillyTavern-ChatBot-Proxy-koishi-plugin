@@ -647,8 +647,6 @@ export function apply(ctx: Context, config: Config) {
     const bindings = await getBindingsForChat(msg.chatId)
     if (!bindings.length) return
 
-    const audioBuffer = Buffer.from(msg.audio, 'base64')
-
     for (const binding of bindings) {
       const key = `${binding.platform}:${binding.channelId}`
       stopTyping(key)
@@ -658,10 +656,11 @@ export function apply(ctx: Context, config: Config) {
 
       try {
         if (binding.platform === 'telegram') {
-          // Use Telegram native sendVoice for voice message display
+          // Use Telegram native sendVoice via FormData (same pattern as adapter's sendPhoto)
+          const audioBuffer = Buffer.from(msg.audio, 'base64')
           const formData = new FormData()
           formData.append('chat_id', binding.channelId)
-          formData.append('voice', new Blob([audioBuffer]), 'voice.ogg')
+          formData.append('voice', new Blob([audioBuffer], { type: 'audio/ogg' }), 'voice.ogg')
           await (bot as any).internal.sendVoice(formData)
         } else {
           // Fallback for other platforms: generic audio element
