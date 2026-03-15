@@ -618,27 +618,48 @@ export function apply(ctx: Context, config: Config) {
     if (!bindings.length) return
 
     for (const binding of bindings) {
+      const key = `${binding.platform}:${binding.channelId}`
+      stopTyping(key)
+
+      const bot = findBot(binding.platform)
+      if (!bot) continue
+
       try {
-        const parts: string[] = []
+        const text = msg.content.text
+          ? `${config.aiMessagePrefix}${msg.characterName}: ${msg.content.text}`
+          : ''
+        const hasImages = msg.content.images && msg.content.images.length > 0
 
-        if (msg.content.text) {
-          parts.push(`${config.aiMessagePrefix}${msg.characterName}: ${msg.content.text}`)
-        }
-
-        if (msg.content.images?.length) {
-          for (const img of msg.content.images) {
+        if (hasImages && binding.platform === 'telegram') {
+          // Send images via Telegram sendPhoto with text as caption
+          for (let i = 0; i < msg.content.images!.length; i++) {
+            const img = msg.content.images![i]
+            const imageBuffer = Buffer.from(img.data, 'base64')
+            const ext = img.mimeType.split('/')[1] || 'jpg'
+            const formData = new FormData()
+            formData.append('chat_id', binding.channelId)
+            formData.append('photo', new Blob([imageBuffer], { type: img.mimeType }), `image.${ext}`)
+            // Add text as caption on the first image only
+            if (i === 0 && text) {
+              formData.append('caption', text)
+            }
+            await (bot as any).internal.sendPhoto(formData)
+          }
+        } else if (hasImages) {
+          // Other platforms: use Satori elements
+          const parts: string[] = []
+          if (text) parts.push(text)
+          for (const img of msg.content.images!) {
             parts.push(h('image', {
               url: `data:${img.mimeType};base64,${img.data}`,
             }).toString())
           }
-        }
-
-        if (parts.length > 0) {
-          await sendToChannel(binding.platform, binding.channelId, parts.join('\n'))
+          await bot.sendMessage(binding.channelId, parts.join('\n'))
+        } else if (text) {
+          await sendToChannel(binding.platform, binding.channelId, text)
         }
       } catch (e) {
-        const channelKey = `${binding.platform}:${binding.channelId}`
-        logger.error(`Failed to broadcast AI message to ${channelKey}:`, e)
+        logger.error(`Failed to broadcast AI message to ${key}:`, e)
       }
     }
   }
