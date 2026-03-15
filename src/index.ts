@@ -860,11 +860,25 @@ export function apply(ctx: Context, config: Config) {
                 logger.info(`Telegram voice fallback: token=${!!token}, fileId=${fileId?.substring(0, 20)}...`)
                 if (token && fileId) {
                   try {
+                    logger.info('Calling Telegram getFile API...')
                     const fileResp = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`)
                     const fileJson = await fileResp.json() as any
+                    logger.info(`getFile response: ok=${fileJson.ok}, file_path=${fileJson.result?.file_path}`)
                     if (fileJson.ok && fileJson.result?.file_path) {
                       const downloadUrl = `https://api.telegram.org/file/bot${token}/${fileJson.result.file_path}`
-                      data = await downloadToBase64(downloadUrl, 'audio/ogg')
+                      logger.info(`Downloading voice from: ${downloadUrl}`)
+                      const resp = await fetch(downloadUrl)
+                      if (resp.ok) {
+                        const buffer = Buffer.from(await resp.arrayBuffer())
+                        logger.info(`Voice downloaded: ${buffer.length} bytes`)
+                        data = {
+                          name: 'voice.ogg',
+                          data: buffer.toString('base64'),
+                          mimeType: 'audio/ogg',
+                        }
+                      } else {
+                        logger.warn(`Voice download failed: HTTP ${resp.status}`)
+                      }
                     }
                   } catch (e) {
                     logger.warn('Failed to download Telegram voice via API:', e)
