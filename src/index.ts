@@ -607,12 +607,12 @@ export function apply(ctx: Context, config: Config) {
   // ----------------------------------------------------------
 
   ctx.middleware(async (session, next) => {
-    logger.debug(`Middleware outer: platform=${session.platform}, channelId=${session.channelId}, userId=${session.userId}, content=${session.content?.substring(0, 30)}`)
+    logger.info(`Middleware outer: platform=${session.platform}, channelId=${session.channelId}, userId=${session.userId}, content=${session.content?.substring(0, 30)}`)
     return next(async (done) => {
       // This callback only runs if the message was NOT consumed by a command
       const pass = () => done?.() as any
 
-      logger.debug(`Middleware inner (not a command): platform=${session.platform}, channelId=${session.channelId}`)
+      logger.info(`Middleware inner (not a command): platform=${session.platform}, channelId=${session.channelId}`)
 
       // Ignore bot's own messages
       if (session.userId === session.selfId) return pass()
