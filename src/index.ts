@@ -413,6 +413,7 @@ export function apply(ctx: Context, config: Config) {
         await broadcastUserMessage(msg)
         break
       case 'ai_message':
+        stopTypingTimersForChat(msg.chatId)
         await broadcastAiMessage(msg)
         break
       case 'ai_tts':
@@ -429,6 +430,7 @@ export function apply(ctx: Context, config: Config) {
         handleRequestResponse(msg)
         break
       case 'send_message_result':
+        if (!msg.success) stopTypingTimer(msg.sourceChannelKey)
         await handleSendMessageResult(msg)
         break
       default:
@@ -476,6 +478,68 @@ export function apply(ctx: Context, config: Config) {
     // Status.ONLINE = 1 (const enum from @satorijs/protocol)
     return ctx.bots.find(b => b.platform === platform && b.status === 1 /* Status.ONLINE */)
   }
+
+  // ----------------------------------------------------------
+  // Typing Indicator
+  // ----------------------------------------------------------
+
+  const TYPING_INTERVAL = 4000 // resend typing every 4s (Telegram expires after 5s)
+  const activeTypingTimers = new Map<string, ReturnType<typeof setInterval>>()
+
+  /** Send a typing indicator for the given session's channel */
+  async function sendTyping(session: any) {
+    try {
+      if (session.platform === 'telegram') {
+        await (session.bot as any).internal.sendChatAction({
+          chat_id: session.channelId,
+          action: 'typing',
+        })
+      } else if (session.platform === 'discord') {
+        await (session.bot as any).internal.triggerTypingIndicator(session.channelId)
+      }
+      // Other platforms: silently skip (no universal typing API)
+    } catch {
+      // Best effort
+    }
+  }
+
+  /** Start a repeating typing indicator for a channel. Returns a key for stopping. */
+  function startTypingTimer(session: any): string {
+    const key = `${session.platform}:${session.channelId}`
+    stopTypingTimer(key)
+    // Send immediately
+    sendTyping(session)
+    // Then repeat every 4s
+    const timer = setInterval(() => sendTyping(session), TYPING_INTERVAL)
+    activeTypingTimers.set(key, timer)
+    return key
+  }
+
+  /** Stop a typing indicator timer by key */
+  function stopTypingTimer(key: string) {
+    const timer = activeTypingTimers.get(key)
+    if (timer) {
+      clearInterval(timer)
+      activeTypingTimers.delete(key)
+    }
+  }
+
+  /** Stop all typing timers for a chatId (when generation ends) */
+  function stopTypingTimersForChat(chatId: string) {
+    // We don't have a direct mapping from chatId to channel keys,
+    // so we stop ALL active timers (generation_ended is global anyway)
+    for (const [key, timer] of activeTypingTimers) {
+      clearInterval(timer)
+    }
+    activeTypingTimers.clear()
+  }
+
+  ctx.on('dispose', () => {
+    for (const timer of activeTypingTimers.values()) {
+      clearInterval(timer)
+    }
+    activeTypingTimers.clear()
+  })
 
   async function getBindingsForChat(chatId: string): Promise<STBinding[]> {
     return ctx.database.get('st_bindings', { stChatId: chatId })
@@ -588,23 +652,40 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  async function setTypingStatus(chatId: string, _typing: boolean) {
-    // Typing indicator is best-effort and platform-dependent.
-    // Many platforms don't have a public API for typing status.
-    // We attempt it but silently ignore failures.
-    const bindings = await getBindingsForChat(chatId)
-    for (const binding of bindings) {
-      const bot = findBot(binding.platform)
-      if (!bot) continue
-
-      try {
-        // Some adapters support sendMessage with typing indicator
-        // For now this is a placeholder — platform-specific typing
-        // would need bot.internal access which varies per adapter.
-        // TODO: implement per-platform typing via bot.internal
-      } catch {
-        // ignored
+  async function setTypingStatus(chatId: string, typing: boolean) {
+    if (typing) {
+      // Start typing timers for all bound channels
+      const bindings = await getBindingsForChat(chatId)
+      for (const binding of bindings) {
+        const bot = findBot(binding.platform)
+        if (!bot) continue
+        const key = `${binding.platform}:${binding.channelId}`
+        stopTypingTimer(key) // clear any existing
+        try {
+          // Send typing via bot internal API
+          if (binding.platform === 'telegram') {
+            await (bot as any).internal.sendChatAction({
+              chat_id: binding.channelId,
+              action: 'typing',
+            })
+          }
+        } catch { /* best effort */ }
+        // Start repeating timer
+        const timer = setInterval(async () => {
+          try {
+            if (binding.platform === 'telegram') {
+              await (bot as any).internal.sendChatAction({
+                chat_id: binding.channelId,
+                action: 'typing',
+              })
+            }
+          } catch { /* best effort */ }
+        }, TYPING_INTERVAL)
+        activeTypingTimers.set(key, timer)
       }
+    } else {
+      // Stop all typing timers
+      stopTypingTimersForChat(chatId)
     }
   }
 
@@ -669,6 +750,9 @@ export function apply(ctx: Context, config: Config) {
 
       const sourceChannelKey = `${session.platform}:${session.channelId}`
       const senderName = session.username || session.userId || 'Unknown'
+
+      // Start typing — will be stopped by generation_ended / ai_message / send_message_result
+      startTypingTimer(session)
 
       let sent = false
 
@@ -745,35 +829,39 @@ export function apply(ctx: Context, config: Config) {
       if (!chatId) return 'Please provide a SillyTavern chat ID.'
       if (!session) return
 
-      // Validate chatId with ST client
-      if (!activeClient || activeClient.readyState !== 1) {
-        return 'ST client is not connected. Cannot validate chat ID.'
+      const typingKey = startTypingTimer(session)
+      try {
+        if (!activeClient || activeClient.readyState !== 1) {
+          return 'ST client is not connected. Cannot validate chat ID.'
+        }
+
+        const reqId = generateRequestId()
+        const result = await requestST<STValidateChatResult>({
+          type: 'validate_chat',
+          requestId: reqId,
+          chatId,
+        })
+
+        if (!result) {
+          return 'ST client did not respond (timeout). Is the browser tab open?'
+        }
+        if (!result.valid) {
+          return `Invalid chat ID: ${result.error || 'not found'}`
+        }
+
+        await ctx.database.upsert('st_bindings', [{
+          platform: session.platform,
+          channelId: session.channelId,
+          guildId: session.guildId || '',
+          stChatId: chatId,
+          createdAt: new Date(),
+          createdBy: session.userId,
+        }], ['platform', 'channelId'])
+
+        return `Bound to SillyTavern chat: ${chatId}`
+      } finally {
+        stopTypingTimer(typingKey)
       }
-
-      const reqId = generateRequestId()
-      const result = await requestST<STValidateChatResult>({
-        type: 'validate_chat',
-        requestId: reqId,
-        chatId,
-      })
-
-      if (!result) {
-        return 'ST client did not respond (timeout). Is the browser tab open?'
-      }
-      if (!result.valid) {
-        return `Invalid chat ID: ${result.error || 'not found'}`
-      }
-
-      await ctx.database.upsert('st_bindings', [{
-        platform: session.platform,
-        channelId: session.channelId,
-        guildId: session.guildId || '',
-        stChatId: chatId,
-        createdAt: new Date(),
-        createdBy: session.userId,
-      }], ['platform', 'channelId'])
-
-      return `Bound to SillyTavern chat: ${chatId}`
     })
 
   ctx.command('st.unbind', 'Unbind this channel from SillyTavern')
@@ -781,44 +869,56 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session }) => {
       if (!session) return
 
-      const removed = await ctx.database.remove('st_bindings', {
-        platform: session.platform,
-        channelId: session.channelId,
-      })
+      const typingKey = startTypingTimer(session)
+      try {
+        const removed = await ctx.database.remove('st_bindings', {
+          platform: session.platform,
+          channelId: session.channelId,
+        })
 
-      if (!removed.matched) {
-        return 'This channel is not bound to any SillyTavern chat.'
+        if (!removed.matched) {
+          return 'This channel is not bound to any SillyTavern chat.'
+        }
+        return 'Unbound from SillyTavern chat.'
+      } finally {
+        stopTypingTimer(typingKey)
       }
-      return 'Unbound from SillyTavern chat.'
     })
 
   ctx.command('st.list', 'List all SillyTavern chats')
     .alias('st-list')
-    .action(async () => {
-      if (!activeClient || activeClient.readyState !== 1) {
-        return 'ST client is not connected.'
-      }
+    .action(async ({ session }) => {
+      if (!session) return
 
-      const reqId = generateRequestId()
-      const result = await requestST<STListChatsResult>({
-        type: 'list_chats',
-        requestId: reqId,
-      })
+      const typingKey = startTypingTimer(session)
+      try {
+        if (!activeClient || activeClient.readyState !== 1) {
+          return 'ST client is not connected.'
+        }
 
-      if (!result) {
-        return 'ST client did not respond (timeout).'
-      }
-      if (result.error) {
-        return `Error: ${result.error}`
-      }
-      if (!result.chats.length) {
-        return 'No chats found.'
-      }
+        const reqId = generateRequestId()
+        const result = await requestST<STListChatsResult>({
+          type: 'list_chats',
+          requestId: reqId,
+        })
 
-      const lines = result.chats.map((chat, i) =>
-        `${i + 1}. [${chat.characterName}] ${chat.chatId} (${chat.messageCount} msgs)`
-      )
-      return lines.join('\n')
+        if (!result) {
+          return 'ST client did not respond (timeout).'
+        }
+        if (result.error) {
+          return `Error: ${result.error}`
+        }
+        if (!result.chats.length) {
+          return 'No chats found.'
+        }
+
+        const lines = result.chats.map((chat, i) =>
+          `${i + 1}. [${chat.characterName}] ${chat.chatId} (${chat.messageCount} msgs)`
+        )
+        return lines.join('\n')
+      } finally {
+        stopTypingTimer(typingKey)
+      }
     })
 
   ctx.command('st.status', 'Show SillyTavern bridge status')
@@ -826,28 +926,35 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session }) => {
       if (!session) return
 
-      const [binding] = await ctx.database.get('st_bindings', {
-        platform: session.platform,
-        channelId: session.channelId,
-      })
+      const typingKey = startTypingTimer(session)
+      try {
+        const [binding] = await ctx.database.get('st_bindings', {
+          platform: session.platform,
+          channelId: session.channelId,
+        })
 
-      const stConnected = activeClient?.readyState === 1
+        const stConnected = activeClient?.readyState === 1
 
-      return [
-        `Binding: ${binding ? binding.stChatId : 'not bound'}`,
-        `ST connection: ${stConnected ? 'online' : 'offline'}`,
-        `ST clients: ${allClients.size}`,
-        `Ping interval: ${config.pingInterval}s`,
-      ].join('\n')
+        return [
+          `Binding: ${binding ? binding.stChatId : 'not bound'}`,
+          `ST connection: ${stConnected ? 'online' : 'offline'}`,
+          `ST clients: ${allClients.size}`,
+          `Ping interval: ${config.pingInterval}s`,
+        ].join('\n')
+      } finally {
+        stopTypingTimer(typingKey)
+      }
     })
 
   ctx.command('st.config <key:string> [value:string]', 'View or update bridge configuration')
     .alias('st-config')
     .usage('Usage: st.config ping <seconds>\nExample: st.config ping 5')
-    .action(async (_, key, value) => {
-      if (!key) {
-        return `Current config:\n  ping: ${config.pingInterval}s`
-      }
+    .action(async ({ session }, key, value) => {
+      const typingKey = session ? startTypingTimer(session) : ''
+      try {
+        if (!key) {
+          return `Current config:\n  ping: ${config.pingInterval}s`
+        }
 
       if (key === 'ping') {
         if (!value) {
@@ -868,6 +975,9 @@ export function apply(ctx: Context, config: Config) {
       }
 
       return `Unknown config key: ${key}\nAvailable keys: ping`
+      } finally {
+        stopTypingTimer(typingKey)
+      }
     })
 
   ctx.command('st.retry', 'Retry the last failed message to SillyTavern')
@@ -875,27 +985,32 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session }) => {
       if (!session) return
 
-      if (!activeClient || activeClient.readyState !== 1) {
-        return 'ST client is not connected. Cannot retry.'
+      const typingKey = startTypingTimer(session)
+      try {
+        if (!activeClient || activeClient.readyState !== 1) {
+          return 'ST client is not connected. Cannot retry.'
+        }
+
+        const channelKey = `${session.platform}:${session.channelId}`
+        const failedMsg = lastFailedMessage.get(channelKey)
+        if (!failedMsg) {
+          return 'No failed message to retry.'
+        }
+
+        // Re-send the failed message
+        const sent = sendToST(failedMsg)
+        if (!sent) {
+          return 'Failed to send. ST client may have disconnected.'
+        }
+
+        // Track it again for potential re-failure
+        pendingSentMessages.set(channelKey, failedMsg)
+        // Clear from failed (will be re-added if it fails again)
+        lastFailedMessage.delete(channelKey)
+
+        return 'Retrying last message...'
+      } finally {
+        stopTypingTimer(typingKey)
       }
-
-      const channelKey = `${session.platform}:${session.channelId}`
-      const failedMsg = lastFailedMessage.get(channelKey)
-      if (!failedMsg) {
-        return 'No failed message to retry.'
-      }
-
-      // Re-send the failed message
-      const sent = sendToST(failedMsg)
-      if (!sent) {
-        return 'Failed to send. ST client may have disconnected.'
-      }
-
-      // Track it again for potential re-failure
-      pendingSentMessages.set(channelKey, failedMsg)
-      // Clear from failed (will be re-added if it fails again)
-      lastFailedMessage.delete(channelKey)
-
-      return 'Retrying last message...'
     })
 }
