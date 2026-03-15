@@ -231,6 +231,11 @@ export function apply(ctx: Context, config: Config) {
   const allClients = new Set<WebSocket>()
   let activeClient: WebSocket | null = null
 
+  /** Stores the last sent message per channel (for retry on failure) */
+  const pendingSentMessages = new Map<string, KoishiSendMessage | KoishiSendFile>()
+  /** Stores the last failed message per channel for st.retry */
+  const lastFailedMessage = new Map<string, KoishiSendMessage | KoishiSendFile>()
+
   /** Send a message to the active ST client */
   function sendToST(msg: KoishiDownstreamMessage): boolean {
     if (!activeClient || activeClient.readyState !== 1) {
@@ -432,29 +437,32 @@ export function apply(ctx: Context, config: Config) {
   }
 
   async function handleSendMessageResult(msg: STSendMessageResult) {
-    logger.info(`Received send_message_result: success=${msg.success}, sourceChannelKey=${msg.sourceChannelKey}, error=${msg.error}`)
+    if (msg.success) {
+      // Clear any pending failed message for this channel
+      pendingSentMessages.delete(msg.sourceChannelKey)
+      lastFailedMessage.delete(msg.sourceChannelKey)
+      return
+    }
 
-    if (msg.success) return // only handle failures
+    // Store the failed message for retry
+    const originalMsg = pendingSentMessages.get(msg.sourceChannelKey)
+    if (originalMsg) {
+      lastFailedMessage.set(msg.sourceChannelKey, originalMsg)
+      pendingSentMessages.delete(msg.sourceChannelKey)
+    }
 
     // Parse sourceChannelKey: "platform:channelId"
     const colonIdx = msg.sourceChannelKey.indexOf(':')
-    if (colonIdx === -1) {
-      logger.warn('Invalid sourceChannelKey format:', msg.sourceChannelKey)
-      return
-    }
+    if (colonIdx === -1) return
 
     const platform = msg.sourceChannelKey.substring(0, colonIdx)
     const channelId = msg.sourceChannelKey.substring(colonIdx + 1)
 
     const bot = findBot(platform)
-    if (!bot) {
-      logger.warn(`No online bot for platform "${platform}", available: [${ctx.bots.map(b => `${b.platform}(${b.status})`).join(', ')}]`)
-      return
-    }
+    if (!bot) return
 
     try {
-      await bot.sendMessage(channelId, `ST error: ${msg.error || 'unknown error'}`)
-      logger.info(`Error notification sent to ${msg.sourceChannelKey}`)
+      await bot.sendMessage(channelId, `ST error: ${msg.error || 'unknown error'}\nUse st.retry to retry.`)
     } catch (e) {
       logger.error(`Failed to send error notification to ${msg.sourceChannelKey}:`, e)
     }
@@ -669,13 +677,16 @@ export function apply(ctx: Context, config: Config) {
 
       // Send text message
       if (text) {
-        sent = sendToST({
+        const msg: KoishiSendMessage = {
           type: 'send_message',
           chatId: binding.stChatId,
           text,
           sourceChannelKey,
           senderName,
-        })
+        }
+        // Track for potential retry
+        pendingSentMessages.set(sourceChannelKey, msg)
+        sent = sendToST(msg)
       }
 
       // Send images as files
@@ -857,5 +868,34 @@ export function apply(ctx: Context, config: Config) {
       }
 
       return `Unknown config key: ${key}\nAvailable keys: ping`
+    })
+
+  ctx.command('st.retry', 'Retry the last failed message to SillyTavern')
+    .alias('st-retry')
+    .action(async ({ session }) => {
+      if (!session) return
+
+      if (!activeClient || activeClient.readyState !== 1) {
+        return 'ST client is not connected. Cannot retry.'
+      }
+
+      const channelKey = `${session.platform}:${session.channelId}`
+      const failedMsg = lastFailedMessage.get(channelKey)
+      if (!failedMsg) {
+        return 'No failed message to retry.'
+      }
+
+      // Re-send the failed message
+      const sent = sendToST(failedMsg)
+      if (!sent) {
+        return 'Failed to send. ST client may have disconnected.'
+      }
+
+      // Track it again for potential re-failure
+      pendingSentMessages.set(channelKey, failedMsg)
+      // Clear from failed (will be re-added if it fails again)
+      lastFailedMessage.delete(channelKey)
+
+      return 'Retrying last message...'
     })
 }
