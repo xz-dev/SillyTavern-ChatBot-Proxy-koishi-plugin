@@ -155,6 +155,14 @@ interface STSendMessageResult {
   error?: string
 }
 
+interface STGetAvatarResult {
+  type: 'get_avatar_result'
+  requestId: string
+  avatar: string | null
+  mimeType?: string
+  error?: string
+}
+
 type STUpstreamMessage =
   | STUserMessage
   | STAiMessage
@@ -164,6 +172,7 @@ type STUpstreamMessage =
   | STValidateChatResult
   | STListChatsResult
   | STSendMessageResult
+  | STGetAvatarResult
 
 /** Messages from Koishi → SillyTavern */
 interface KoishiSendMessage {
@@ -197,7 +206,13 @@ interface KoishiListChats {
   requestId: string
 }
 
-type KoishiDownstreamMessage = KoishiSendMessage | KoishiSendFile | KoishiValidateChat | KoishiListChats
+interface KoishiGetAvatar {
+  type: 'get_avatar'
+  requestId: string
+  characterName: string
+}
+
+type KoishiDownstreamMessage = KoishiSendMessage | KoishiSendFile | KoishiValidateChat | KoishiListChats | KoishiGetAvatar
 
 // ============================================================
 // Plugin Entry
@@ -275,7 +290,7 @@ export function apply(ctx: Context, config: Config) {
     })
   }
 
-  function handleRequestResponse(msg: STValidateChatResult | STListChatsResult) {
+  function handleRequestResponse(msg: STValidateChatResult | STListChatsResult | STGetAvatarResult) {
     const pending = pendingRequests.get(msg.requestId)
     if (pending) {
       clearTimeout(pending.timer)
@@ -425,6 +440,7 @@ export function apply(ctx: Context, config: Config) {
         break
       case 'validate_chat_result':
       case 'list_chats_result':
+      case 'get_avatar_result':
         handleRequestResponse(msg)
         break
       case 'send_message_result':
@@ -461,6 +477,62 @@ export function apply(ctx: Context, config: Config) {
       await sendToChannel(platform, channelId, `ST error: ${msg.error || 'unknown error'}\nUse st.retry to retry.`)
     } catch (e) {
       logger.error(`Failed to send error notification to ${msg.sourceChannelKey}:`, e)
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Bot Avatar Sync
+  // ----------------------------------------------------------
+
+  async function syncBotAvatar(chatId: string) {
+    if (!activeClient || activeClient.readyState !== 1) return
+
+    // Extract character name from chatId
+    const sepIdx = chatId.indexOf(' - ')
+    if (sepIdx === -1) return
+    const charName = chatId.substring(0, sepIdx)
+
+    const reqId = generateRequestId()
+    const result = await requestST<STGetAvatarResult>({
+      type: 'get_avatar',
+      requestId: reqId,
+      characterName: charName,
+    })
+
+    if (!result || !result.avatar) {
+      logger.warn('Failed to get avatar:', result?.error || 'no response')
+      return
+    }
+
+    const imageBuffer = Buffer.from(result.avatar, 'base64')
+
+    // Set avatar for all bots that have bindings to this chatId
+    const bindings = await ctx.database.get('st_bindings', { stChatId: chatId })
+    const platforms = new Set(bindings.map(b => b.platform))
+
+    for (const platform of platforms) {
+      const bot = findBot(platform)
+      if (!bot) continue
+
+      try {
+        if (platform === 'telegram') {
+          const token = (bot.config as any)?.token
+          if (!token) continue
+          const formData = new FormData()
+          formData.append('photo', new Blob([imageBuffer], { type: result.mimeType || 'image/png' }), 'avatar.png')
+          await fetch(`https://api.telegram.org/bot${token}/setMyProfilePhoto`, {
+            method: 'POST',
+            body: formData,
+          })
+          logger.info(`Telegram bot avatar updated for character: ${charName}`)
+        } else if (platform === 'discord') {
+          const base64 = `data:image/png;base64,${result.avatar}`
+          await (bot as any).internal.modifyCurrentUser({ avatar: base64 })
+          logger.info(`Discord bot avatar updated for character: ${charName}`)
+        }
+      } catch (e) {
+        logger.warn(`Failed to set bot avatar for ${platform}:`, e)
+      }
     }
   }
 
@@ -722,9 +794,10 @@ export function apply(ctx: Context, config: Config) {
         return pass()
       }
 
-      // Extract text content
+      // Extract text content, images, and audio
       const textParts: string[] = []
       const images: Array<{ name: string; data: string; mimeType: string }> = []
+      const audioFiles: Array<{ name: string; data: string; mimeType: string }> = []
 
       if (session.elements) {
         for (const el of session.elements) {
@@ -744,6 +817,18 @@ export function apply(ctx: Context, config: Config) {
                 logger.warn('Failed to fetch image:', e)
               }
             }
+          } else if (el.type === 'audio' || el.type === 'record' || el.type === 'voice') {
+            const url = el.attrs?.url || el.attrs?.src
+            if (url) {
+              try {
+                const audioData = await fetchUrlAsBase64(url)
+                if (audioData) {
+                  audioFiles.push(audioData)
+                }
+              } catch (e) {
+                logger.warn('Failed to fetch audio:', e)
+              }
+            }
           }
         }
       }
@@ -751,8 +836,8 @@ export function apply(ctx: Context, config: Config) {
       // Fallback to session.content if no elements parsed
       const text = textParts.join('').trim() || session.content?.trim() || ''
 
-      // Skip empty messages with no images
-      if (!text && images.length === 0) return pass()
+      // Skip empty messages with no media
+      if (!text && images.length === 0 && audioFiles.length === 0) return pass()
 
       const sourceChannelKey = `${session.platform}:${session.channelId}`
       const senderName = session.username || session.userId || 'Unknown'
@@ -788,10 +873,22 @@ export function apply(ctx: Context, config: Config) {
         if (ok) sent = true
       }
 
+      // Send audio files (will be STT-transcribed by ST client)
+      for (const audio of audioFiles) {
+        const ok = sendToST({
+          type: 'send_file',
+          chatId: binding.stChatId,
+          file: audio,
+          sourceChannelKey,
+          senderName,
+        })
+        if (ok) sent = true
+      }
+
       if (sent) {
         // New message sent successfully — clear stale failed message for this channel
         lastFailedMessage.delete(sourceChannelKey)
-      } else if (text || images.length > 0) {
+      } else if (text || images.length > 0 || audioFiles.length > 0) {
         await session.send('Failed to forward message to ST.')
       }
 
@@ -863,6 +960,9 @@ export function apply(ctx: Context, config: Config) {
           createdAt: new Date(),
           createdBy: session.userId,
         }], ['platform', 'channelId'])
+
+        // Sync bot avatar with the character's avatar (async, don't wait)
+        syncBotAvatar(chatId).catch(e => logger.warn('Avatar sync failed:', e))
 
         return `Bound to SillyTavern chat: ${chatId}`
       } finally {
