@@ -819,6 +819,9 @@ export function apply(ctx: Context, config: Config) {
       const images: Array<{ name: string; data: string; mimeType: string }> = []
       const audioFiles: Array<{ name: string; data: string; mimeType: string }> = []
 
+      // Debug: log all elements
+      logger.info(`Message elements: ${JSON.stringify(session.elements?.map(e => ({ type: e.type, attrs: e.attrs })))}`)
+
       if (session.elements) {
         for (const el of session.elements) {
           const src = el.attrs?.src || el.attrs?.url
