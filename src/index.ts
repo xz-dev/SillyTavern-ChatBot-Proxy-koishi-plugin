@@ -299,8 +299,7 @@ export function apply(ctx: Context, config: Config) {
   const allClients = new Set<WebSocket>()
   let activeClient: WebSocket | null = null
 
-  /** One-shot callbacks invoked when a new ST client connects */
-  const onConnectCallbacks: Array<() => void> = []
+
 
   /** Stores the last sent message per channel (for retry on failure) */
   const pendingSentMessages = new Map<string, KoishiSendCombinedMessage>()
@@ -409,6 +408,8 @@ export function apply(ctx: Context, config: Config) {
     logger.info(`ST client cleaned up. Remaining: ${allClients.size}`)
     if (allClients.size === 0) {
       stopPingTimer()
+      // Notify all bound channels
+      broadcastToAllChannels('SillyTavern offline')
     }
   }
 
@@ -429,10 +430,8 @@ export function apply(ctx: Context, config: Config) {
     logger.info(`ST client connected. Total: ${allClients.size}, using latest.`)
     startPingTimer()
 
-    // Fire one-shot connect callbacks
-    while (onConnectCallbacks.length > 0) {
-      onConnectCallbacks.shift()!()
-    }
+    // Notify all bound channels
+    broadcastToAllChannels('SillyTavern online')
 
     // RFC 6455: browser auto-replies pong to our ping
     socket.on('pong', () => {
@@ -477,6 +476,18 @@ export function apply(ctx: Context, config: Config) {
     allClients.clear()
     clientAlive.clear()
     activeClient = null
+  })
+
+  // ----------------------------------------------------------
+  // Status Notifications (event-driven)
+  // ----------------------------------------------------------
+
+  // Bot comes online → notify all bound channels on that platform
+  ctx.on('bot-status-updated', (bot) => {
+    if (bot.status === 1 /* Status.ONLINE */) {
+      logger.info(`Bot ${bot.platform} is online, notifying bound channels`)
+      broadcastToAllChannels("I'm back online — ready when you are.", bot.platform)
+    }
   })
 
   // ----------------------------------------------------------
@@ -641,6 +652,16 @@ export function apply(ctx: Context, config: Config) {
     const bot = findBot(platform)
     if (!bot) return
     await bot.sendMessage(channelId, content)
+  }
+
+  /** Broadcast a message to all bound channels, optionally filtered by platform */
+  async function broadcastToAllChannels(content: string, platformFilter?: string) {
+    const query: any = {}
+    if (platformFilter) query.platform = platformFilter
+    const bindings = await ctx.database.get('st_bindings', query)
+    for (const b of bindings) {
+      sendToChannel(b.platform, b.channelId, content).catch(() => {})
+    }
   }
 
   // ----------------------------------------------------------
@@ -1197,23 +1218,6 @@ export function apply(ctx: Context, config: Config) {
         return 'ST client is not connected.'
       }
       sendToST({ type: 'reload_page' })
-
-      // Monitor reconnection for up to 5 minutes
-      const platform = session.platform
-      const channelId = session.channelId!
-      const cb = () => {
-        clearTimeout(timeout)
-        sendToChannel(platform, channelId, 'SillyTavern come back').catch(() => {})
-      }
-      const timeout = setTimeout(() => {
-        const idx = onConnectCallbacks.indexOf(cb)
-        if (idx !== -1) {
-          onConnectCallbacks.splice(idx, 1)
-          sendToChannel(platform, channelId, 'SillyTavern did not reconnect within 5 minutes.').catch(() => {})
-        }
-      }, 5 * 60 * 1000)
-      onConnectCallbacks.push(cb)
-
       return 'SillyTavern reload signal sent.'
     })
 }
