@@ -849,6 +849,8 @@ export function apply(ctx: Context, config: Config) {
       const textParts: string[] = []
       const files: Array<{ name: string; data: string; mimeType: string }> = []
 
+      logger.info(`Message elements: ${session.elements?.map((e: any) => e.type).join(', ') || 'none'}`)
+
       if (session.elements) {
         for (const el of session.elements) {
           const src = el.attrs?.src || el.attrs?.url
@@ -861,6 +863,7 @@ export function apply(ctx: Context, config: Config) {
               break
             default: {
               // Handle all file-like elements: image, img, audio, voice, record, video, file, etc.
+              logger.info(`Processing element type="${el.type}" src="${src?.substring(0, 60) || 'none'}"`)
               if (!src && !session.platform) break
               let data = src?.startsWith('http') ? await downloadToBase64(src, 'application/octet-stream') : null
               if (!data && session.platform === 'telegram') {
@@ -955,15 +958,27 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  /** Download a Telegram file by file_id via bot.internal.getFile + direct API download */
+  /** Download a Telegram file by file_id via internal.getFile API + native fetch */
   async function downloadTelegramFile(session: any, fileId: string, defaultName: string, defaultMime: string): Promise<{ name: string; data: string; mimeType: string } | null> {
     try {
       const token = (session.bot.config as any)?.token
-      if (!token) return null
+      if (!token) { logger.warn('No Telegram bot token found'); return null }
+
+      // Use Telegram Bot API getFile (via adapter's internal interface)
       const file = await (session.bot as any).internal.getFile({ file_id: fileId })
-      if (!file?.file_path) return null
+      if (!file?.file_path) { logger.warn(`getFile returned no file_path for ${fileId}`); return null }
+
+      // Download via native fetch (bypasses ctx.http which may have issues in containers)
       const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`
-      return await downloadToBase64(url, defaultMime)
+      const resp = await fetch(url)
+      if (!resp.ok) { logger.warn(`Telegram file download HTTP ${resp.status}`); return null }
+      const buffer = Buffer.from(await resp.arrayBuffer())
+      const ext = file.file_path.split('.').pop() || 'bin'
+      return {
+        name: defaultName || `file.${ext}`,
+        data: buffer.toString('base64'),
+        mimeType: defaultMime || 'application/octet-stream',
+      }
     } catch (e) {
       logger.warn('Telegram file download failed:', e)
     }
