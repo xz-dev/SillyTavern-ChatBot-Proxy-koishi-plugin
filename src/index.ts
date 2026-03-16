@@ -1051,7 +1051,7 @@ export function apply(ctx: Context, config: Config) {
         }
 
         const lines = result.chats.map((chat, i) =>
-          `${i + 1}. [${chat.characterName}] ${chat.chatId} (${chat.messageCount} msgs)`
+          `${i + 1}. [${h('b', chat.characterName).toString()}] ${h('code', chat.chatId).toString()} (${chat.messageCount} msgs)`
         )
         return lines.join('\n')
       } finally {
@@ -1074,7 +1074,7 @@ export function apply(ctx: Context, config: Config) {
         const stConnected = activeClient?.readyState === 1
 
         return [
-          `Binding: ${binding ? binding.stChatId : 'not bound'}`,
+          `Binding: ${binding ? h('code', binding.stChatId).toString() : 'not bound'}`,
           `ST connection: ${stConnected ? 'online' : 'offline'}`,
           `ST clients: ${allClients.size}`,
           `Ping interval: ${config.pingInterval}s`,
