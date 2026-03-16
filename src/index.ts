@@ -644,7 +644,7 @@ export function apply(ctx: Context, config: Config) {
 
   /** Wrap text in a blockquote element for system/header messages */
   function sysMsg(text: string): string {
-    return h('quote', {}, text).toString()
+    return `<quote>${text}</quote>`
   }
 
   /** Send a message to a channel, releasing any typing lock first */
