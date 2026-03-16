@@ -957,17 +957,15 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  /** Download a Telegram file by file_id using the adapter's built-in $getFileFromId */
+  /** Download a Telegram file by file_id via bot.internal.getFile + direct API download */
   async function downloadTelegramFile(session: any, fileId: string, defaultName: string, defaultMime: string): Promise<{ name: string; data: string; mimeType: string } | null> {
     try {
-      const result = await (session.bot as any).$getFileFromId(fileId)
-      if (!result?.src) return null
-      if (result.src.startsWith('data:')) {
-        const match = result.src.match(/^data:([^;]+);base64,(.*)$/)
-        if (match) return { name: defaultName, data: match[2], mimeType: match[1] }
-      } else {
-        return await downloadToBase64(result.src, defaultMime)
-      }
+      const token = (session.bot.config as any)?.token
+      if (!token) return null
+      const file = await (session.bot as any).internal.getFile({ file_id: fileId })
+      if (!file?.file_path) return null
+      const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`
+      return await downloadToBase64(url, defaultMime)
     } catch (e) {
       logger.warn('Telegram file download failed:', e)
     }
