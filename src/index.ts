@@ -461,11 +461,20 @@ export function apply(ctx: Context, config: Config) {
       case 'ai_tts':
         await broadcastAiTts(msg)
         break
-      case 'generation_started':
-      case 'generation_ended':
-        // Typing is handled by startTyping/stopTyping + ctx.before('send')
-        // No action needed here
+      case 'generation_started': {
+        const bindings = await getBindingsForChat(msg.chatId)
+        for (const binding of bindings) {
+          startTypingForChannel(binding.platform, binding.channelId)
+        }
         break
+      }
+      case 'generation_ended': {
+        const bindings = await getBindingsForChat(msg.chatId)
+        for (const binding of bindings) {
+          stopTypingForChannel(binding.platform, binding.channelId)
+        }
+        break
+      }
       case 'validate_chat_result':
       case 'list_chats_result':
       case 'get_avatar_result':
@@ -608,16 +617,16 @@ export function apply(ctx: Context, config: Config) {
   const TYPING_INTERVAL = 4000 // resend typing every 4s (Telegram expires after 5s)
   const typingLocks = new Map<string, { release: () => void }>()
 
-  /** Send a single typing action for a session (best-effort) */
-  async function sendTypingAction(session: any) {
+  /** Send a single typing action for a channel (best-effort) */
+  async function sendTypingAction(bot: any, channelId: string) {
     try {
-      if (session.platform === 'telegram') {
-        await (session.bot as any).internal.sendChatAction({
-          chat_id: session.channelId,
+      if (bot.platform === 'telegram') {
+        await (bot as any).internal.sendChatAction({
+          chat_id: channelId,
           action: 'typing',
         })
-      } else if (session.platform === 'discord') {
-        await (session.bot as any).internal.triggerTypingIndicator(session.channelId)
+      } else if (bot.platform === 'discord') {
+        await (bot as any).internal.triggerTypingIndicator(channelId)
       }
     } catch {
       // best effort
@@ -625,11 +634,13 @@ export function apply(ctx: Context, config: Config) {
   }
 
   /**
-   * Start typing for a channel. Returns the channel key.
-   * Typing continues until stopTyping(key) is called or ctx.before('send') fires.
+   * Start typing for a specific platform and channel.
+   * Typing continues until stopTyping is called.
    */
-  function startTyping(session: any): string {
-    const key = `${session.platform}:${session.channelId}`
+  function startTypingForChannel(platform: string, channelId: string): string {
+    const key = `${platform}:${channelId}`
+    const bot = findBot(platform)
+    if (!bot) return key
 
     // Release any existing typing lock for this channel
     typingLocks.get(key)?.release()
@@ -650,7 +661,7 @@ export function apply(ctx: Context, config: Config) {
     // Start typing loop (async, non-blocking)
     ;(async () => {
       while (!released) {
-        await sendTypingAction(session)
+        await sendTypingAction(bot, channelId)
         // Wait 4s OR lock release, whichever comes first
         await Promise.race([
           new Promise(r => setTimeout(r, TYPING_INTERVAL)),
@@ -663,15 +674,20 @@ export function apply(ctx: Context, config: Config) {
     return key
   }
 
+  function stopTypingForChannel(platform: string, channelId: string) {
+    const key = `${platform}:${channelId}`
+    typingLocks.get(key)?.release()
+  }
+
+  /** Legacy helper for commands using session */
+  function startTyping(session: any): string {
+    return startTypingForChannel(session.platform, session.channelId)
+  }
+
   /** Stop typing for a channel by key */
   function stopTyping(key: string) {
     typingLocks.get(key)?.release()
   }
-
-  // Auto-release: when bot sends ANY message, stop typing for that channel
-  ctx.before('send', (session) => {
-    stopTyping(`${session.platform}:${session.channelId}`)
-  })
 
   ctx.on('dispose', () => {
     for (const lock of typingLocks.values()) {
