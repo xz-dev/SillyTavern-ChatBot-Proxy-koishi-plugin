@@ -24,8 +24,7 @@ Bridges SillyTavern chats to Koishi bot channels via WebSocket.
 export interface Config {
   wsPath: string
   apiKey: string
-  userMessagePrefix: string
-  aiMessagePrefix: string
+  showAiName: boolean
   pingInterval: number
 }
 
@@ -37,12 +36,9 @@ export const Config: Schema<Config> = Schema.object({
     .required()
     .role('secret')
     .description('API key for authenticating SillyTavern clients'),
-  userMessagePrefix: Schema.string()
-    .default('')
-    .description('Prefix for user messages broadcast to channels (e.g. "📝 ")'),
-  aiMessagePrefix: Schema.string()
-    .default('')
-    .description('Prefix for AI messages broadcast to channels (e.g. "🤖 ")'),
+  showAiName: Schema.boolean()
+    .default(true)
+    .description('Show AI character name as a header before messages'),
   pingInterval: Schema.number()
     .default(10)
     .min(1)
@@ -409,7 +405,7 @@ export function apply(ctx: Context, config: Config) {
     if (allClients.size === 0) {
       stopPingTimer()
       // Notify all bound channels
-      broadcastToAllChannels('SillyTavern offline')
+      broadcastToAllChannels(sysMsg('SillyTavern offline'))
     }
   }
 
@@ -431,7 +427,7 @@ export function apply(ctx: Context, config: Config) {
     startPingTimer()
 
     // Notify all bound channels
-    broadcastToAllChannels('SillyTavern online')
+    broadcastToAllChannels(sysMsg('SillyTavern online'))
 
     // RFC 6455: browser auto-replies pong to our ping
     socket.on('pong', () => {
@@ -486,7 +482,7 @@ export function apply(ctx: Context, config: Config) {
   ctx.on('bot-status-updated', (bot) => {
     if (bot.status === 1 /* Status.ONLINE */) {
       logger.info(`Bot ${bot.platform} is online, notifying bound channels`)
-      broadcastToAllChannels("I'm back online — ready when you are.", bot.platform)
+      broadcastToAllChannels(sysMsg("I'm back online — ready when you are."), bot.platform)
     }
   })
 
@@ -555,7 +551,7 @@ export function apply(ctx: Context, config: Config) {
     const channelId = msg.sourceChannelKey.substring(colonIdx + 1)
 
     try {
-      await sendToChannel(platform, channelId, `ST error: ${msg.error || 'unknown error'}\nUse st.retry to retry.`)
+      await sendToChannel(platform, channelId, sysMsg(`ST error: ${msg.error || 'unknown error'}\nUse st.retry to retry.`))
     } catch (e) {
       logger.error(`Failed to send error notification to ${msg.sourceChannelKey}:`, e)
     }
@@ -644,6 +640,11 @@ export function apply(ctx: Context, config: Config) {
   function findBot(platform: string) {
     // Status.ONLINE = 1 (const enum from @satorijs/protocol)
     return ctx.bots.find(b => b.platform === platform && b.status === 1 /* Status.ONLINE */)
+  }
+
+  /** Wrap text in a blockquote element for system/header messages */
+  function sysMsg(text: string): string {
+    return h('quote', {}, text).toString()
   }
 
   /** Send a message to a channel, releasing any typing lock first */
@@ -776,7 +777,7 @@ export function apply(ctx: Context, config: Config) {
 
         // Text
         if (msg.content.text) {
-          parts.push(`${config.userMessagePrefix}${msg.userName}: ${msg.content.text}`)
+          parts.push(`${sysMsg(`${msg.userName}:`)}\n${msg.content.text}`)
         }
 
         // Images
@@ -819,7 +820,9 @@ export function apply(ctx: Context, config: Config) {
 
       try {
         const text = msg.content.text
-          ? `${config.aiMessagePrefix}${msg.characterName}: ${msg.content.text}`
+          ? (config.showAiName
+            ? `${sysMsg(`${msg.characterName}:`)}\n${msg.content.text}`
+            : msg.content.text)
           : ''
         const hasImages = msg.content.images && msg.content.images.length > 0
 
@@ -902,7 +905,7 @@ export function apply(ctx: Context, config: Config) {
 
       // No active ST client — notify user
       if (!activeClient || activeClient.readyState !== 1) {
-        await session.send('ST client is not connected. Message not forwarded.')
+        await session.send(sysMsg('ST client is not connected. Message not forwarded.'))
         return pass()
       }
 
@@ -983,7 +986,7 @@ export function apply(ctx: Context, config: Config) {
         // New message sent successfully — clear stale failed message for this channel
         lastFailedMessage.delete(sourceChannelKey)
       } else {
-        await session.send('Failed to forward message to ST.')
+        await session.send(sysMsg('Failed to forward message to ST.'))
       }
 
       return pass()
@@ -1049,11 +1052,11 @@ export function apply(ctx: Context, config: Config) {
     .usage('Usage: st.bind <chatId>\nGet the chatId from st.list or the SillyTavern extension settings panel.')
     .example('st.bind Ani - 2026-03-14@18h06m18s170ms')
     .action(async ({ session }, chatId) => {
-      if (!chatId) return 'Please provide a SillyTavern chat ID.'
+      if (!chatId) return sysMsg('Please provide a SillyTavern chat ID.')
       if (!session) return
 
       if (!activeClient || activeClient.readyState !== 1) {
-        return 'ST client is not connected. Cannot validate chat ID.'
+        return sysMsg('ST client is not connected. Cannot validate chat ID.')
       }
 
       const reqId = generateRequestId()
@@ -1064,10 +1067,10 @@ export function apply(ctx: Context, config: Config) {
       })
 
       if (!result) {
-        return 'ST client did not respond (timeout). Is the browser tab open?'
+        return sysMsg('ST client did not respond (timeout). Is the browser tab open?')
       }
       if (!result.valid) {
-        return `Invalid chat ID: ${result.error || 'not found'}`
+        return sysMsg(`Invalid chat ID: ${result.error || 'not found'}`)
       }
 
       await ctx.database.upsert('st_bindings', [{
@@ -1082,7 +1085,7 @@ export function apply(ctx: Context, config: Config) {
       // Sync bot avatar with the character's avatar (async, don't wait)
       syncBotAvatar(chatId).catch(e => logger.warn('Avatar sync failed:', e))
 
-      return `Bound to SillyTavern chat: ${chatId}`
+      return sysMsg(`Bound to SillyTavern chat: ${chatId}`)
     })
 
   ctx.command('st.unbind', 'Unbind this channel from SillyTavern')
@@ -1096,9 +1099,9 @@ export function apply(ctx: Context, config: Config) {
       })
 
       if (!removed.matched) {
-        return 'This channel is not bound to any SillyTavern chat.'
+        return sysMsg('This channel is not bound to any SillyTavern chat.')
       }
-      return 'Unbound from SillyTavern chat.'
+      return sysMsg('Unbound from SillyTavern chat.')
     })
 
   ctx.command('st.list', 'List all SillyTavern chats')
@@ -1107,7 +1110,7 @@ export function apply(ctx: Context, config: Config) {
       if (!session) return
 
       if (!activeClient || activeClient.readyState !== 1) {
-        return 'ST client is not connected.'
+        return sysMsg('ST client is not connected.')
       }
 
       const reqId = generateRequestId()
@@ -1117,19 +1120,19 @@ export function apply(ctx: Context, config: Config) {
       })
 
       if (!result) {
-        return 'ST client did not respond (timeout).'
+        return sysMsg('ST client did not respond (timeout).')
       }
       if (result.error) {
-        return `Error: ${result.error}`
+        return sysMsg(`Error: ${result.error}`)
       }
       if (!result.chats.length) {
-        return 'No chats found.'
+        return sysMsg('No chats found.')
       }
 
       const lines = result.chats.map((chat, i) =>
         `${i + 1}. [${h('b', chat.characterName).toString()}] ${h('code', chat.chatId).toString()} (${chat.messageCount} msgs)`
       )
-      return lines.join('\n')
+      return sysMsg(lines.join('\n'))
     })
 
   ctx.command('st.status', 'Show SillyTavern bridge status')
@@ -1144,41 +1147,54 @@ export function apply(ctx: Context, config: Config) {
 
       const stConnected = activeClient?.readyState === 1
 
-      return [
+      return sysMsg([
         `Binding: ${binding ? h('code', binding.stChatId).toString() : 'not bound'}`,
         `ST connection: ${stConnected ? 'online' : 'offline'}`,
         `ST clients: ${allClients.size}`,
         `Ping interval: ${config.pingInterval}s`,
-      ].join('\n')
+      ].join('\n'))
     })
 
   ctx.command('st.config <key:string> [value:string]', 'View or update bridge configuration')
     .alias('st-config')
-    .usage('Usage: st.config ping <seconds>\nExample: st.config ping 5')
+    .usage('Usage: st.config <key> [value]\nKeys: ping <seconds>, ainame <true|false>')
+    .example('st.config ping 5')
+    .example('st.config ainame false')
     .action(async ({ session }, key, value) => {
       if (!key) {
-        return `Current config:\n  ping: ${config.pingInterval}s`
+        return sysMsg(`Current config:\n  ping: ${config.pingInterval}s\n  ainame: ${config.showAiName}`)
       }
 
       if (key === 'ping') {
         if (!value) {
-          return `ping: ${config.pingInterval}s`
+          return sysMsg(`ping: ${config.pingInterval}s`)
         }
         const seconds = parseInt(value, 10)
         if (isNaN(seconds) || seconds < 1 || seconds > 300) {
-          return 'Invalid value. ping must be 1-300 seconds.'
+          return sysMsg('Invalid value. ping must be 1-300 seconds.')
         }
         config.pingInterval = seconds
         // Restart ping timer with new interval
         if (allClients.size > 0) {
           startPingTimer()
         }
-        // Persist to koishi.yml via ctx.scope
         ctx.scope.update(config)
-        return `Ping interval set to ${seconds}s (saved)`
+        return sysMsg(`Ping interval set to ${seconds}s (saved)`)
       }
 
-      return `Unknown config key: ${key}\nAvailable keys: ping`
+      if (key === 'ainame') {
+        if (!value) {
+          return sysMsg(`ainame: ${config.showAiName}`)
+        }
+        if (value !== 'true' && value !== 'false') {
+          return sysMsg('Invalid value. ainame must be true or false.')
+        }
+        config.showAiName = value === 'true'
+        ctx.scope.update(config)
+        return sysMsg(`AI name display ${config.showAiName ? 'enabled' : 'disabled'} (saved)`)
+      }
+
+      return sysMsg(`Unknown config key: ${key}\nAvailable keys: ping, ainame`)
     })
 
   ctx.command('st.retry', 'Retry the last failed message to SillyTavern')
@@ -1187,19 +1203,19 @@ export function apply(ctx: Context, config: Config) {
       if (!session) return
 
       if (!activeClient || activeClient.readyState !== 1) {
-        return 'ST client is not connected. Cannot retry.'
+        return sysMsg('ST client is not connected. Cannot retry.')
       }
 
       const channelKey = `${session.platform}:${session.channelId}`
       const failedMsg = lastFailedMessage.get(channelKey)
       if (!failedMsg) {
-        return 'No failed message to retry.'
+        return sysMsg('No failed message to retry.')
       }
 
       // Re-send the failed message
       const sent = sendToST(failedMsg)
       if (!sent) {
-        return 'Failed to send. ST client may have disconnected.'
+        return sysMsg('Failed to send. ST client may have disconnected.')
       }
 
       // Track it again for potential re-failure
@@ -1207,7 +1223,7 @@ export function apply(ctx: Context, config: Config) {
       // Clear from failed (will be re-added if it fails again)
       lastFailedMessage.delete(channelKey)
 
-      return 'Retrying last message...'
+      return sysMsg('Retrying last message...')
     })
 
   ctx.command('st.reload', 'Force reload the SillyTavern browser page')
@@ -1215,9 +1231,9 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session }) => {
       if (!session) return
       if (!activeClient || activeClient.readyState !== 1) {
-        return 'ST client is not connected.'
+        return sysMsg('ST client is not connected.')
       }
       sendToST({ type: 'reload_page' })
-      return 'SillyTavern reload signal sent.'
+      return sysMsg('SillyTavern reload signal sent.')
     })
 }

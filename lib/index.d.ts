@@ -5,8 +5,7 @@ export declare const usage = "\nBridges SillyTavern chats to Koishi bot channels
 export interface Config {
     wsPath: string;
     apiKey: string;
-    userMessagePrefix: string;
-    aiMessagePrefix: string;
+    showAiName: boolean;
     pingInterval: number;
 }
 export declare const Config: Schema<Config>;
