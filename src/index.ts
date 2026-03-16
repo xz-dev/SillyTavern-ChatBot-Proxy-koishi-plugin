@@ -847,8 +847,7 @@ export function apply(ctx: Context, config: Config) {
 
       // Extract text, images, and audio from message elements
       const textParts: string[] = []
-      const images: Array<{ name: string; data: string; mimeType: string }> = []
-      const audioFiles: Array<{ name: string; data: string; mimeType: string }> = []
+      const files: Array<{ name: string; data: string; mimeType: string }> = []
 
       if (session.elements) {
         for (const el of session.elements) {
@@ -860,28 +859,27 @@ export function apply(ctx: Context, config: Config) {
             case 'at':
               textParts.push(`@${el.attrs?.name || el.attrs?.id || ''}`)
               break
-            case 'image':
-            case 'img': {
-              let data = src ? await downloadToBase64(src, 'image/jpeg') : null
+            default: {
+              // Handle all file-like elements: image, img, audio, voice, record, video, file, etc.
+              if (!src && !session.platform) break
+              let data = src?.startsWith('http') ? await downloadToBase64(src, 'application/octet-stream') : null
               if (!data && session.platform === 'telegram') {
-                const rawEvent = (session.event as any)?._data
-                const photo = rawEvent?.message?.photo
-                const fileId = photo?.[photo.length - 1]?.file_id
-                if (fileId) data = await downloadTelegramFile(session, fileId, 'photo.jpg', 'image/jpeg')
+                const rawEvent = (session.event as any)?._data?.message || (session.event as any)?._data
+                // Try to extract file_id from various Telegram message types
+                const fileId =
+                  rawEvent?.photo?.[rawEvent.photo.length - 1]?.file_id ||
+                  rawEvent?.voice?.file_id ||
+                  rawEvent?.audio?.file_id ||
+                  rawEvent?.video?.file_id ||
+                  rawEvent?.document?.file_id ||
+                  rawEvent?.sticker?.file_id ||
+                  rawEvent?.video_note?.file_id ||
+                  rawEvent?.animation?.file_id
+                const fileName = rawEvent?.document?.file_name || el.attrs?.file || `file.bin`
+                const mimeType = rawEvent?.document?.mime_type || rawEvent?.audio?.mime_type || rawEvent?.video?.mime_type || 'application/octet-stream'
+                if (fileId) data = await downloadTelegramFile(session, fileId, fileName, mimeType)
               }
-              if (data) images.push(data)
-              break
-            }
-            case 'audio':
-            case 'voice':
-            case 'record': {
-              let data = src?.startsWith('http') ? await downloadToBase64(src, 'audio/ogg') : null
-              if (!data && session.platform === 'telegram') {
-                const rawEvent = (session.event as any)?._data
-                const fileId = rawEvent?.message?.voice?.file_id || rawEvent?.message?.audio?.file_id
-                if (fileId) data = await downloadTelegramFile(session, fileId, 'voice.ogg', 'audio/ogg')
-              }
-              if (data) audioFiles.push(data)
+              if (data) files.push(data)
               break
             }
           }
@@ -895,7 +893,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // Skip empty messages with no media
-      if (!text && images.length === 0 && audioFiles.length === 0) {
+      if (!text && files.length === 0) {
         stopTyping(`${session.platform}:${session.channelId}`)
         return pass()
       }
@@ -907,7 +905,7 @@ export function apply(ctx: Context, config: Config) {
         type: 'send_combined_message',
         chatId: binding.stChatId,
         text,
-        files: [...images, ...audioFiles],
+        files,
         sourceChannelKey,
         senderName,
       }
