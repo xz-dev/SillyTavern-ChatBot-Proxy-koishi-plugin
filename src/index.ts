@@ -1214,6 +1214,6 @@ export function apply(ctx: Context, config: Config) {
       }, 5 * 60 * 1000)
       onConnectCallbacks.push(cb)
 
-      return 'Reload signal sent. Monitoring reconnection for 5 minutes...'
+      return 'SillyTavern reload signal sent.'
     })
 }
