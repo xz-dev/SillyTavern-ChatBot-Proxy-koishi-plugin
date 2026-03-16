@@ -868,6 +868,7 @@ export function apply(ctx: Context, config: Config) {
               let data = src?.startsWith('http') ? await downloadToBase64(src, 'application/octet-stream') : null
               if (!data && session.platform === 'telegram') {
                 const rawEvent = (session.event as any)?._data?.message || (session.event as any)?._data
+                logger.info(`Telegram fallback: rawEvent keys=${Object.keys(rawEvent || {})}`)
                 // Try to extract file_id from various Telegram message types
                 const fileId =
                   rawEvent?.photo?.[rawEvent.photo.length - 1]?.file_id ||
@@ -880,7 +881,11 @@ export function apply(ctx: Context, config: Config) {
                   rawEvent?.animation?.file_id
                 const fileName = rawEvent?.document?.file_name || el.attrs?.file || `file.bin`
                 const mimeType = rawEvent?.document?.mime_type || rawEvent?.audio?.mime_type || rawEvent?.video?.mime_type || 'application/octet-stream'
-                if (fileId) data = await downloadTelegramFile(session, fileId, fileName, mimeType)
+                logger.info(`Telegram fallback: fileId=${fileId}, fileName=${fileName}, mimeType=${mimeType}`)
+                if (fileId) {
+                  data = await downloadTelegramFile(session, fileId, fileName, mimeType)
+                  logger.info(`Telegram fallback download result: ${data ? 'success' : 'failed'}`)
+                }
               }
               if (data) files.push(data)
               break
