@@ -754,8 +754,18 @@ export function apply(ctx: Context, config: Config) {
       if (!bot) continue
 
       try {
-        const audioUrl = `data:${msg.mimeType};base64,${msg.audio}`
-        await bot.sendMessage(binding.channelId, h('audio', { url: audioUrl }).toString())
+        if (binding.platform === 'telegram') {
+          // Use Telegram native sendVoice via FormData (same pattern as adapter's sendPhoto)
+          const audioBuffer = Buffer.from(msg.audio, 'base64')
+          const ext = msg.mimeType === 'audio/mpeg' ? 'mp3' : 'ogg'
+          const formData = new FormData()
+          formData.append('chat_id', binding.channelId)
+          formData.append('voice', new Blob([audioBuffer], { type: msg.mimeType }), `voice.${ext}`)
+          await (bot as any).internal.sendVoice(formData)
+        } else {
+          const audioUrl = `data:${msg.mimeType};base64,${msg.audio}`
+          await bot.sendMessage(binding.channelId, h('audio', { url: audioUrl }).toString())
+        }
       } catch (e) {
         logger.error(`Failed to broadcast TTS to ${key}:`, e)
       }
