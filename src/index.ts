@@ -248,6 +248,19 @@ export function apply(ctx: Context, config: Config) {
   // Without this, document/file messages crash the adapter's addResource
   // ----------------------------------------------------------
 
+  // Patch all existing bots
+  for (const bot of ctx.bots) {
+    if (bot.platform === 'telegram' && (bot as any).$getFileFromId) {
+      const original = (bot as any).$getFileFromId.bind(bot)
+      ;(bot as any).$getFileFromId = async (file_id: string) => {
+        const result = await original(file_id)
+        return result || {}
+      }
+      logger.info('Patched existing Telegram bot $getFileFromId')
+    }
+  }
+
+  // Patch any future bots
   ctx.on('bot-added', (bot) => {
     if (bot.platform !== 'telegram' || !(bot as any).$getFileFromId) return
     const original = (bot as any).$getFileFromId.bind(bot)
@@ -255,6 +268,7 @@ export function apply(ctx: Context, config: Config) {
       const result = await original(file_id)
       return result || {}
     }
+    logger.info('Patched new Telegram bot $getFileFromId')
   })
 
   // ----------------------------------------------------------
