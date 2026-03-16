@@ -203,22 +203,15 @@ type STUpstreamMessage =
   | STGetAvatarResult
 
 /** Messages from Koishi → SillyTavern */
-interface KoishiSendMessage {
-  type: 'send_message'
+interface KoishiSendCombinedMessage {
+  type: 'send_combined_message'
   chatId: string
   text: string
-  sourceChannelKey: string
-  senderName: string
-}
-
-interface KoishiSendFile {
-  type: 'send_file'
-  chatId: string
-  file: {
+  files: Array<{
     name: string
     data: string
     mimeType: string
-  }
+  }>
   sourceChannelKey: string
   senderName: string
 }
@@ -240,7 +233,7 @@ interface KoishiGetAvatar {
   characterName: string
 }
 
-type KoishiDownstreamMessage = KoishiSendMessage | KoishiSendFile | KoishiValidateChat | KoishiListChats | KoishiGetAvatar
+type KoishiDownstreamMessage = KoishiSendCombinedMessage | KoishiValidateChat | KoishiListChats | KoishiGetAvatar
 
 // ============================================================
 // Plugin Entry
@@ -275,9 +268,9 @@ export function apply(ctx: Context, config: Config) {
   let activeClient: WebSocket | null = null
 
   /** Stores the last sent message per channel (for retry on failure) */
-  const pendingSentMessages = new Map<string, KoishiSendMessage | KoishiSendFile>()
+  const pendingSentMessages = new Map<string, KoishiSendCombinedMessage>()
   /** Stores the last failed message per channel for st.retry */
-  const lastFailedMessage = new Map<string, KoishiSendMessage | KoishiSendFile>()
+  const lastFailedMessage = new Map<string, KoishiSendCombinedMessage>()
 
   /** Send a message to the active ST client */
   function sendToST(msg: KoishiDownstreamMessage): boolean {
@@ -916,8 +909,11 @@ export function apply(ctx: Context, config: Config) {
         }
       }
 
-      // Fallback to session.content if no elements parsed
-      const text = textParts.join('').trim() || session.content?.trim() || ''
+      let text = textParts.join('').trim()
+      // Only fallback to session.content if no elements were parsed at all
+      if (!session.elements || session.elements.length === 0) {
+        text = text || session.content?.trim() || ''
+      }
 
       // Skip empty messages with no media
       if (!text && images.length === 0 && audioFiles.length === 0) {
@@ -928,50 +924,23 @@ export function apply(ctx: Context, config: Config) {
       const sourceChannelKey = `${session.platform}:${session.channelId}`
       const senderName = session.username || session.userId || 'Unknown'
 
-      let sent = false
-
-      // Send text message
-      if (text) {
-        const msg: KoishiSendMessage = {
-          type: 'send_message',
-          chatId: binding.stChatId,
-          text,
-          sourceChannelKey,
-          senderName,
-        }
-        // Track for potential retry
-        pendingSentMessages.set(sourceChannelKey, msg)
-        sent = sendToST(msg)
+      const msg: KoishiSendCombinedMessage = {
+        type: 'send_combined_message',
+        chatId: binding.stChatId,
+        text,
+        files: [...images, ...audioFiles],
+        sourceChannelKey,
+        senderName,
       }
 
-      // Send images as files
-      for (const img of images) {
-        const ok = sendToST({
-          type: 'send_file',
-          chatId: binding.stChatId,
-          file: img,
-          sourceChannelKey,
-          senderName,
-        })
-        if (ok) sent = true
-      }
-
-      // Send audio files (will be STT-transcribed by ST client)
-      for (const audio of audioFiles) {
-        const ok = sendToST({
-          type: 'send_file',
-          chatId: binding.stChatId,
-          file: audio,
-          sourceChannelKey,
-          senderName,
-        })
-        if (ok) sent = true
-      }
+      // Track for potential retry
+      pendingSentMessages.set(sourceChannelKey, msg)
+      const sent = sendToST(msg)
 
       if (sent) {
         // New message sent successfully — clear stale failed message for this channel
         lastFailedMessage.delete(sourceChannelKey)
-      } else if (text || images.length > 0 || audioFiles.length > 0) {
+      } else {
         await session.send('Failed to forward message to ST.')
       }
 
