@@ -849,8 +849,6 @@ export function apply(ctx: Context, config: Config) {
       const textParts: string[] = []
       const files: Array<{ name: string; data: string; mimeType: string }> = []
 
-      logger.info(`Message elements: ${session.elements?.map((e: any) => e.type).join(', ') || 'none'}`)
-
       if (session.elements) {
         for (const el of session.elements) {
           const src = el.attrs?.src || el.attrs?.url
@@ -863,13 +861,10 @@ export function apply(ctx: Context, config: Config) {
               break
             default: {
               // Handle all file-like elements: image, img, audio, voice, record, video, file, etc.
-              logger.info(`Processing element type="${el.type}" src="${src?.substring(0, 60) || 'none'}"`)
               if (!src && !session.platform) break
               let data = src?.startsWith('http') ? await downloadToBase64(src, 'application/octet-stream') : null
               if (!data && session.platform === 'telegram') {
                 const rawEvent = (session.event as any)?._data?.message || (session.event as any)?._data
-                logger.info(`Telegram fallback: rawEvent keys=${Object.keys(rawEvent || {})}`)
-                // Try to extract file_id from various Telegram message types
                 const fileId =
                   rawEvent?.photo?.[rawEvent.photo.length - 1]?.file_id ||
                   rawEvent?.voice?.file_id ||
@@ -879,13 +874,15 @@ export function apply(ctx: Context, config: Config) {
                   rawEvent?.sticker?.file_id ||
                   rawEvent?.video_note?.file_id ||
                   rawEvent?.animation?.file_id
-                const fileName = rawEvent?.document?.file_name || el.attrs?.file || `file.bin`
-                const mimeType = rawEvent?.document?.mime_type || rawEvent?.audio?.mime_type || rawEvent?.video?.mime_type || 'application/octet-stream'
-                logger.info(`Telegram fallback: fileId=${fileId}, fileName=${fileName}, mimeType=${mimeType}`)
-                if (fileId) {
-                  data = await downloadTelegramFile(session, fileId, fileName, mimeType)
-                  logger.info(`Telegram fallback download result: ${data ? 'success' : 'failed'}`)
-                }
+                const isPhoto = !!rawEvent?.photo
+                const isVoice = !!rawEvent?.voice
+                const isAudio = !!rawEvent?.audio
+                const isVideo = !!rawEvent?.video
+                const fileName = rawEvent?.document?.file_name
+                  || (isPhoto ? 'photo.jpg' : isVoice ? 'voice.ogg' : isAudio ? 'audio.mp3' : isVideo ? 'video.mp4' : 'file.bin')
+                const mimeType = rawEvent?.document?.mime_type || rawEvent?.audio?.mime_type || rawEvent?.video?.mime_type
+                  || (isPhoto ? 'image/jpeg' : isVoice ? 'audio/ogg' : isAudio ? 'audio/mpeg' : isVideo ? 'video/mp4' : 'application/octet-stream')
+                if (fileId) data = await downloadTelegramFile(session, fileId, fileName, mimeType)
               }
               if (data) files.push(data)
               break
