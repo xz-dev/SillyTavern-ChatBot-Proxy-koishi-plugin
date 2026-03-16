@@ -244,6 +244,20 @@ const logger = new Logger('st-bridge')
 export function apply(ctx: Context, config: Config) {
 
   // ----------------------------------------------------------
+  // Patch: fix Telegram adapter $getFileFromId returning undefined
+  // Without this, document/file messages crash the adapter's addResource
+  // ----------------------------------------------------------
+
+  ctx.on('bot-added', (bot) => {
+    if (bot.platform !== 'telegram' || !(bot as any).$getFileFromId) return
+    const original = (bot as any).$getFileFromId.bind(bot)
+    ;(bot as any).$getFileFromId = async (file_id: string) => {
+      const result = await original(file_id)
+      return result || {}
+    }
+  })
+
+  // ----------------------------------------------------------
   // Database table
   // ----------------------------------------------------------
 
