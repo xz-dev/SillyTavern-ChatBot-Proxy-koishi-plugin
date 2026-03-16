@@ -233,7 +233,11 @@ interface KoishiGetAvatar {
   characterName: string
 }
 
-type KoishiDownstreamMessage = KoishiSendCombinedMessage | KoishiValidateChat | KoishiListChats | KoishiGetAvatar
+interface KoishiReloadPage {
+  type: 'reload_page'
+}
+
+type KoishiDownstreamMessage = KoishiSendCombinedMessage | KoishiValidateChat | KoishiListChats | KoishiGetAvatar | KoishiReloadPage
 
 // ============================================================
 // Plugin Entry
@@ -1175,5 +1179,16 @@ export function apply(ctx: Context, config: Config) {
       lastFailedMessage.delete(channelKey)
 
       return 'Retrying last message...'
+    })
+
+  ctx.command('st.reload', 'Force reload the SillyTavern browser page')
+    .alias('st-reload')
+    .action(async ({ session }) => {
+      if (!session) return
+      if (!activeClient || activeClient.readyState !== 1) {
+        return 'ST client is not connected.'
+      }
+      sendToST({ type: 'reload_page' })
+      return 'Reload signal sent to SillyTavern.'
     })
 }
