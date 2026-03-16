@@ -50,8 +50,36 @@ export const Config: Schema<Config> = Schema.object({
     .description('WebSocket ping interval in seconds (RFC 6455 protocol-level ping)'),
 })
 
+import ffmpeg from 'fluent-ffmpeg'
+import ffmpegInstaller from '@ffmpeg-installer/ffmpeg'
+import { PassThrough } from 'stream'
+
+// Configure fluent-ffmpeg with the static binary
+ffmpeg.setFfmpegPath(ffmpegInstaller.path)
+
+async function convertToOggOpus(inputBuffer: Buffer): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const inputStream = new PassThrough()
+    inputStream.end(inputBuffer)
+
+    const chunks: Buffer[] = []
+    const outputStream = new PassThrough()
+
+    outputStream.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+    outputStream.on('end', () => resolve(Buffer.concat(chunks)))
+    outputStream.on('error', reject)
+
+    ffmpeg(inputStream)
+      .inputFormat('mp3') // Assume MP3 since most TTS from ST are MP3, or we can omit to auto-detect
+      .outputFormat('ogg')
+      .audioCodec('libopus')
+      .on('error', reject)
+      .pipe(outputStream)
+  })
+}
+
 // ============================================================
-// Service Dependencies
+// Service Interface
 // ============================================================
 
 export const inject = {
@@ -754,18 +782,24 @@ export function apply(ctx: Context, config: Config) {
       if (!bot) continue
 
       try {
-        if (binding.platform === 'telegram') {
-          // Use Telegram native sendVoice via FormData (same pattern as adapter's sendPhoto)
-          const audioBuffer = Buffer.from(msg.audio, 'base64')
-          const ext = msg.mimeType === 'audio/mpeg' ? 'mp3' : 'ogg'
-          const formData = new FormData()
-          formData.append('chat_id', binding.channelId)
-          formData.append('voice', new Blob([audioBuffer], { type: msg.mimeType }), `voice.${ext}`)
-          await (bot as any).internal.sendVoice(formData)
-        } else {
-          const audioUrl = `data:${msg.mimeType};base64,${msg.audio}`
-          await bot.sendMessage(binding.channelId, h('audio', { url: audioUrl }).toString())
+        const audioBuffer = Buffer.from(msg.audio, 'base64')
+        const isMp3OrOgg = msg.mimeType === 'audio/mpeg' || msg.mimeType === 'audio/ogg'
+        
+        let finalBuffer = audioBuffer
+        let mimeType = msg.mimeType
+        
+        // Transcode to OGG Opus to ensure native voice message format across all platforms
+        if (isMp3OrOgg && msg.mimeType !== 'audio/ogg') {
+          try {
+            finalBuffer = await convertToOggOpus(audioBuffer) as any
+            mimeType = 'audio/ogg'
+          } catch (err) {
+            logger.warn('Failed to transcode TTS audio to OGG, falling back to original format', err)
+          }
         }
+        
+        const audioUrl = `data:${mimeType};base64,${finalBuffer.toString('base64')}`
+        await bot.sendMessage(binding.channelId, h('audio', { url: audioUrl }).toString())
       } catch (e) {
         logger.error(`Failed to broadcast TTS to ${key}:`, e)
       }
