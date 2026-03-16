@@ -299,6 +299,9 @@ export function apply(ctx: Context, config: Config) {
   const allClients = new Set<WebSocket>()
   let activeClient: WebSocket | null = null
 
+  /** One-shot callbacks invoked when a new ST client connects */
+  const onConnectCallbacks: Array<() => void> = []
+
   /** Stores the last sent message per channel (for retry on failure) */
   const pendingSentMessages = new Map<string, KoishiSendCombinedMessage>()
   /** Stores the last failed message per channel for st.retry */
@@ -425,6 +428,11 @@ export function apply(ctx: Context, config: Config) {
     activeClient = socket
     logger.info(`ST client connected. Total: ${allClients.size}, using latest.`)
     startPingTimer()
+
+    // Fire one-shot connect callbacks
+    while (onConnectCallbacks.length > 0) {
+      onConnectCallbacks.shift()!()
+    }
 
     // RFC 6455: browser auto-replies pong to our ping
     socket.on('pong', () => {
@@ -1189,6 +1197,23 @@ export function apply(ctx: Context, config: Config) {
         return 'ST client is not connected.'
       }
       sendToST({ type: 'reload_page' })
-      return 'Reload signal sent to SillyTavern.'
+
+      // Monitor reconnection for up to 5 minutes
+      const platform = session.platform
+      const channelId = session.channelId!
+      const cb = () => {
+        clearTimeout(timeout)
+        sendToChannel(platform, channelId, 'SillyTavern come back').catch(() => {})
+      }
+      const timeout = setTimeout(() => {
+        const idx = onConnectCallbacks.indexOf(cb)
+        if (idx !== -1) {
+          onConnectCallbacks.splice(idx, 1)
+          sendToChannel(platform, channelId, 'SillyTavern did not reconnect within 5 minutes.').catch(() => {})
+        }
+      }, 5 * 60 * 1000)
+      onConnectCallbacks.push(cb)
+
+      return 'Reload signal sent. Monitoring reconnection for 5 minutes...'
     })
 }
