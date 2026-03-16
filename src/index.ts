@@ -861,46 +861,25 @@ export function apply(ctx: Context, config: Config) {
               textParts.push(`@${el.attrs?.name || el.attrs?.id || ''}`)
               break
             case 'image':
-            case 'img':
-              if (src) {
-                const data = await downloadToBase64(src, 'image/jpeg')
-                if (data) images.push(data)
+            case 'img': {
+              let data = src ? await downloadToBase64(src, 'image/jpeg') : null
+              if (!data && session.platform === 'telegram') {
+                const rawEvent = (session.event as any)?._data
+                const photo = rawEvent?.message?.photo
+                const fileId = photo?.[photo.length - 1]?.file_id
+                if (fileId) data = await downloadTelegramFile(session, fileId, 'photo.jpg', 'image/jpeg')
               }
+              if (data) images.push(data)
               break
+            }
             case 'audio':
             case 'voice':
             case 'record': {
-              let data = null
-              if (src && (src.startsWith('http://') || src.startsWith('https://'))) {
-                data = await downloadToBase64(src, 'audio/ogg')
-              } else if (session.platform === 'telegram') {
-                // Adapter failed to resolve file URL (missing selfUrl config)
-                // Fall back to Telegram Bot API: extract file_id from raw event
-                const token = (session.bot.config as any)?.token || (session.bot as any).config?.token
+              let data = src?.startsWith('http') ? await downloadToBase64(src, 'audio/ogg') : null
+              if (!data && session.platform === 'telegram') {
                 const rawEvent = (session.event as any)?._data
-                const fileId = rawEvent?.message?.voice?.file_id || rawEvent?.message?.audio?.file_id || rawEvent?.voice?.file_id || rawEvent?.audio?.file_id
-                if (token && fileId) {
-                  try {
-                    const fileResp = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`)
-                    const fileJson = await fileResp.json() as any
-                    if (fileJson.ok && fileJson.result?.file_path) {
-                      const downloadUrl = `https://api.telegram.org/file/bot${token}/${fileJson.result.file_path}`
-                      const resp = await fetch(downloadUrl)
-                      if (resp.ok) {
-                        const buffer = Buffer.from(await resp.arrayBuffer())
-                        data = {
-                          name: 'voice.ogg',
-                          data: buffer.toString('base64'),
-                          mimeType: 'audio/ogg',
-                        }
-                      } else {
-                        logger.warn(`Voice download failed: HTTP ${resp.status}`)
-                      }
-                    }
-                  } catch (e) {
-                    logger.warn('Failed to download Telegram voice via API:', e)
-                  }
-                }
+                const fileId = rawEvent?.message?.voice?.file_id || rawEvent?.message?.audio?.file_id
+                if (fileId) data = await downloadTelegramFile(session, fileId, 'voice.ogg', 'audio/ogg')
               }
               if (data) audioFiles.push(data)
               break
@@ -976,6 +955,23 @@ export function apply(ctx: Context, config: Config) {
       logger.warn(`Failed to download ${url}:`, e)
       return null
     }
+  }
+
+  /** Download a Telegram file by file_id using the adapter's built-in $getFileFromId */
+  async function downloadTelegramFile(session: any, fileId: string, defaultName: string, defaultMime: string): Promise<{ name: string; data: string; mimeType: string } | null> {
+    try {
+      const result = await (session.bot as any).$getFileFromId(fileId)
+      if (!result?.src) return null
+      if (result.src.startsWith('data:')) {
+        const match = result.src.match(/^data:([^;]+);base64,(.*)$/)
+        if (match) return { name: defaultName, data: match[2], mimeType: match[1] }
+      } else {
+        return await downloadToBase64(result.src, defaultMime)
+      }
+    } catch (e) {
+      logger.warn('Telegram file download failed:', e)
+    }
+    return null
   }
 
   // ----------------------------------------------------------
