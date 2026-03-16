@@ -632,11 +632,21 @@ export function apply(ctx: Context, config: Config) {
   }
 
   // ----------------------------------------------------------
-  // Typing Indicator (Promise lock pattern)
+  // Typing Indicator (Heartbeat pattern)
+  //
+  // ST sends generation_started every 2s as a heartbeat.
+  // Koishi records the arrival time using its own clock.
+  // The typing loop checks each cycle: if no heartbeat
+  // within 8s, the loop exits automatically.
   // ----------------------------------------------------------
 
-  const TYPING_INTERVAL = 4000 // resend typing every 4s (Telegram expires after 5s)
-  const typingLocks = new Map<string, { release: () => void }>()
+  const TYPING_INTERVAL = 4000    // resend typing every 4s (Telegram expires after 5s)
+  const HEARTBEAT_TIMEOUT = 8000  // stop typing if no heartbeat for 8s
+
+  /** Per-channel heartbeat timestamp. 0 = default / explicit stop. */
+  const typingHeartbeats = new Map<string, number>()
+  /** Tracks which channels currently have an active typing loop. */
+  const typingLoopActive = new Set<string>()
 
   /** Send a single typing action for a channel (best-effort) */
   async function sendTypingAction(bot: any, channelId: string) {
@@ -655,66 +665,64 @@ export function apply(ctx: Context, config: Config) {
   }
 
   /**
-   * Start typing for a specific platform and channel.
-   * Typing continues until stopTyping is called.
+   * Start or refresh typing for a specific platform and channel.
+   * - If a loop is already running: just update the heartbeat timestamp.
+   * - If no loop exists: update heartbeat and start a new typing loop.
    */
   function startTypingForChannel(platform: string, channelId: string): string {
     const key = `${platform}:${channelId}`
+
+    // Always update heartbeat to current time
+    typingHeartbeats.set(key, Date.now())
+
+    // If loop already running, heartbeat refresh is enough
+    if (typingLoopActive.has(key)) return key
+
     const bot = findBot(platform)
     if (!bot) return key
 
-    // Release any existing typing lock for this channel
-    typingLocks.get(key)?.release()
-
-    // Create a lock (pending Promise + release function)
-    let released = false
-    let releaseFn!: () => void
-    const lockPromise = new Promise<void>(resolve => {
-      releaseFn = () => {
-        if (released) return
-        released = true
-        resolve()
-      }
-    })
-
-    typingLocks.set(key, { release: releaseFn })
-
     // Start typing loop (async, non-blocking)
+    typingLoopActive.add(key)
     ;(async () => {
-      while (!released) {
+      while (true) {
+        const lastHeartbeat = typingHeartbeats.get(key) ?? 0
+        if (Date.now() - lastHeartbeat >= HEARTBEAT_TIMEOUT) break
         await sendTypingAction(bot, channelId)
-        // Wait 4s OR lock release, whichever comes first
-        await Promise.race([
-          new Promise(r => setTimeout(r, TYPING_INTERVAL)),
-          lockPromise,
-        ])
+        await new Promise(r => setTimeout(r, TYPING_INTERVAL))
       }
-      typingLocks.delete(key)
+      typingLoopActive.delete(key)
+      // Note: heartbeat is NOT reset to 0 here.
+      // Only stopTypingForChannel sets it to 0 (explicit stop intent).
     })()
 
     return key
   }
 
+  /**
+   * Explicitly stop typing for a channel by setting heartbeat to 0.
+   * The loop will see Date.now() - 0 ≫ 8s on its next check and exit.
+   */
   function stopTypingForChannel(platform: string, channelId: string) {
     const key = `${platform}:${channelId}`
-    typingLocks.get(key)?.release()
+    typingHeartbeats.set(key, 0)
   }
 
-  /** Legacy helper for commands using session */
+  /** Helper for commands using session */
   function startTyping(session: any): string {
     return startTypingForChannel(session.platform, session.channelId)
   }
 
   /** Stop typing for a channel by key */
   function stopTyping(key: string) {
-    typingLocks.get(key)?.release()
+    typingHeartbeats.set(key, 0)
   }
 
   ctx.on('dispose', () => {
-    for (const lock of typingLocks.values()) {
-      lock.release()
+    for (const key of typingHeartbeats.keys()) {
+      typingHeartbeats.set(key, 0)
     }
-    typingLocks.clear()
+    typingHeartbeats.clear()
+    typingLoopActive.clear()
   })
 
   async function getBindingsForChat(chatId: string): Promise<STBinding[]> {
