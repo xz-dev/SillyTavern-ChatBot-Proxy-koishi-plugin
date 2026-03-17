@@ -410,7 +410,7 @@ export function apply(ctx: Context, config: Config) {
       stopPingTimer()
       // Notify all bound channels
       if (config.notifySTOnline) {
-        broadcastTemporary(sysMsg('SillyTavern offline'))
+        broadcastTemporary('SillyTavern offline', 30000, undefined, true)
       }
     }
   }
@@ -434,7 +434,7 @@ export function apply(ctx: Context, config: Config) {
 
     // Notify all bound channels
     if (config.notifySTOnline) {
-      broadcastTemporary(sysMsg('SillyTavern online'))
+      broadcastTemporary('SillyTavern online', 30000, undefined, true)
     }
 
     // RFC 6455: browser auto-replies pong to our ping
@@ -491,7 +491,7 @@ export function apply(ctx: Context, config: Config) {
     if (bot.status === 1 /* Status.ONLINE */) {
       logger.info(`Bot ${bot.platform} is online, notifying bound channels`)
       if (config.notifyBotOnline) {
-        broadcastTemporary(sysMsg("I'm back online — ready when you are."), 30000, bot.platform)
+        broadcastTemporary("I'm back online — ready when you are.", 30000, bot.platform, true)
       }
     }
   })
@@ -563,7 +563,7 @@ export function apply(ctx: Context, config: Config) {
     const channelId = msg.sourceChannelKey.substring(colonIdx + 1)
 
     try {
-      await sendToChannel(platform, channelId, sysMsg(`ST error: ${msg.error || 'unknown error'}\nUse st.retry to retry.`))
+      await sendMuted(platform, channelId, `ST error: ${msg.error || 'unknown error'}\nUse st.retry to retry.`)
     } catch (e) {
       logger.error(`Failed to send error notification to ${msg.sourceChannelKey}:`, e)
     }
@@ -659,6 +659,78 @@ export function apply(ctx: Context, config: Config) {
     return `<quote>${text}</quote>`
   }
 
+  /** Escape HTML special characters for Telegram HTML parse mode */
+  function escapeHtml(text: string): string {
+    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  }
+
+  /**
+   * Format system text as a blockquote for a specific platform's native API.
+   * Used by sendMuted() which bypasses the Satori MessageEncoder.
+   */
+  function sysMsgNative(text: string, platform: string): string {
+    switch (platform) {
+      case 'telegram':
+        return `<blockquote>${escapeHtml(text)}</blockquote>`
+      case 'discord':
+        return text.split('\n').map(l => `> ${l}`).join('\n')
+      default:
+        return text
+    }
+  }
+
+  /**
+   * Send a message silently (no push notification) if the platform supports it.
+   * Falls back to normal bot.sendMessage() on unsupported platforms.
+   * @param text - Raw text content (NOT wrapped in sysMsg; formatting is handled internally)
+   * @returns message IDs array (for auto-delete), or empty on failure
+   */
+  async function sendMuted(platform: string, channelId: string, text: string): Promise<string[]> {
+    stopTyping(`${platform}:${channelId}`)
+    const bot = findBot(platform)
+    if (!bot) return []
+
+    try {
+      switch (platform) {
+        case 'telegram': {
+          const result = await (bot as any).internal.sendMessage({
+            chat_id: channelId,
+            text: sysMsgNative(text, 'telegram'),
+            parse_mode: 'HTML',
+            disable_notification: true,
+          })
+          return [String(result.message_id)]
+        }
+        case 'discord': {
+          const result = await (bot as any).internal.createMessage(channelId, {
+            content: sysMsgNative(text, 'discord'),
+            flags: 1 << 12, // SUPPRESS_NOTIFICATIONS
+          })
+          return [result.id]
+        }
+        case 'matrix': {
+          const txnId = `m${Date.now()}${Math.random().toString(36).slice(2, 6)}`
+          const result = await (bot as any).http.put(
+            `/client/v3/rooms/${encodeURIComponent(channelId)}/send/m.room.message/${txnId}`,
+            {
+              msgtype: 'm.notice',
+              body: text,
+              format: 'org.matrix.custom.html',
+              formatted_body: `<blockquote>${escapeHtml(text)}</blockquote>`,
+            },
+          )
+          return [(result as any).event_id]
+        }
+        default:
+          // Platform does not support muted sending — fall back to normal send
+          return await bot.sendMessage(channelId, sysMsg(text)) ?? []
+      }
+    } catch (e) {
+      logger.warn(`sendMuted failed on ${platform}:${channelId}:`, e)
+      return []
+    }
+  }
+
   /** Send a message to a channel, releasing any typing lock first */
   async function sendToChannel(platform: string, channelId: string, content: string) {
     stopTyping(`${platform}:${channelId}`)
@@ -677,12 +749,19 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  /** Send a message and auto-delete it after a delay (best-effort) */
-  async function sendTemporary(platform: string, channelId: string, content: string, deleteAfterMs = 30000) {
+  /**
+   * Send a message and auto-delete it after a delay (best-effort).
+   * @param content - When muted=false, should be pre-formatted (e.g. sysMsg wrapped).
+   *                  When muted=true, should be raw text (sendMuted handles formatting).
+   * @param muted - If true, send silently via sendMuted() (no push notification).
+   */
+  async function sendTemporary(platform: string, channelId: string, content: string, deleteAfterMs = 30000, muted = false) {
     const bot = findBot(platform)
     if (!bot) return
     try {
-      const msgIds = await bot.sendMessage(channelId, content)
+      const msgIds = muted
+        ? await sendMuted(platform, channelId, content)
+        : await bot.sendMessage(channelId, content)
       if (msgIds?.length) {
         setTimeout(async () => {
           for (const id of msgIds) {
@@ -695,13 +774,17 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  /** Broadcast a temporary message to all bound channels, auto-deleted after delay */
-  async function broadcastTemporary(content: string, deleteAfterMs = 30000, platformFilter?: string) {
+  /**
+   * Broadcast a temporary message to all bound channels, auto-deleted after delay.
+   * @param content - When muted=false, should be pre-formatted. When muted=true, raw text.
+   * @param muted - If true, send silently via sendMuted() (no push notification).
+   */
+  async function broadcastTemporary(content: string, deleteAfterMs = 30000, platformFilter?: string, muted = false) {
     const query: any = {}
     if (platformFilter) query.platform = platformFilter
     const bindings = await ctx.database.get('st_bindings', query)
     for (const b of bindings) {
-      sendTemporary(b.platform, b.channelId, content, deleteAfterMs)
+      sendTemporary(b.platform, b.channelId, content, deleteAfterMs, muted)
     }
   }
 
@@ -954,7 +1037,7 @@ export function apply(ctx: Context, config: Config) {
 
       // No active ST client — notify user
       if (!activeClient || activeClient.readyState !== 1) {
-        await session.send(sysMsg('ST client is not connected. Message not forwarded.'))
+        await sendMuted(session.platform, session.channelId!, 'ST client is not connected. Message not forwarded.')
         return pass()
       }
 
@@ -1036,7 +1119,7 @@ export function apply(ctx: Context, config: Config) {
         // New message sent successfully — clear stale failed message for this channel
         lastFailedMessage.delete(sourceChannelKey)
       } else {
-        await session.send(sysMsg('Failed to forward message to ST.'))
+        await sendMuted(session.platform, session.channelId!, 'Failed to forward message to ST.')
       }
 
       return pass()
