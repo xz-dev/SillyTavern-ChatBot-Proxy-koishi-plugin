@@ -262,7 +262,7 @@ export function apply(ctx: Context, config: Config) {
       const original = (bot as any).$getFileFromId.bind(bot)
       ;(bot as any).$getFileFromId = async (file_id: string) => {
         const result = await original(file_id)
-        return result || {}
+        return { ...(result || {}), 'file-id': file_id }
       }
       logger.info('Patched existing Telegram bot $getFileFromId')
     }
@@ -274,7 +274,7 @@ export function apply(ctx: Context, config: Config) {
     const original = (bot as any).$getFileFromId.bind(bot)
     ;(bot as any).$getFileFromId = async (file_id: string) => {
       const result = await original(file_id)
-      return result || {}
+      return { ...(result || {}), 'file-id': file_id }
     }
     logger.info('Patched new Telegram bot $getFileFromId')
   })
@@ -967,9 +967,38 @@ export function apply(ctx: Context, config: Config) {
               break
             default: {
               // Handle all file-like elements: image, img, audio, voice, record, video, file, etc.
-              if (!src && !session.platform) break
-              let data = src?.startsWith('http') ? await downloadToBase64(src, 'application/octet-stream') : null
-              if (!data && session.platform === 'telegram') {
+              let data: { name: string; data: string; mimeType: string } | null = null
+
+              // Tier 1: Use src attribute from adapter
+              if (src) {
+                logger.debug(`Element ${el.type} src: ${src.substring(0, 80)}...`)
+                if (src.startsWith('data:')) {
+                  // Adapter already downloaded — extract base64 directly
+                  const buf = Buffer.from(
+                    await ctx.http.get(src, { responseType: 'arraybuffer' })
+                  )
+                  if (buf.length) {
+                    const mimeType = src.split(';')[0].split(':')[1] || 'application/octet-stream'
+                    const ext = mimeType.split('/')[1] || 'bin'
+                    data = { name: `file.${ext}`, data: buf.toString('base64'), mimeType }
+                  }
+                } else {
+                  data = await downloadToBase64(src, 'application/octet-stream')
+                }
+              }
+
+              // Tier 2: Use file-id attribute to retry download (from patched $getFileFromId)
+              if (!data && session.platform === 'telegram' && el.attrs?.['file-id']) {
+                logger.debug(`Tier 2 fallback: downloading file-id ${el.attrs['file-id']} for element ${el.type}`)
+                const t = el.type
+                const defaultName = t === 'img' ? 'photo.jpg' : t === 'audio' ? 'audio.ogg' : t === 'video' ? 'video.mp4' : 'file.bin'
+                const defaultMime = t === 'img' ? 'image/jpeg' : t === 'audio' ? 'audio/ogg' : t === 'video' ? 'video/mp4' : 'application/octet-stream'
+                data = await downloadTelegramFile(session, el.attrs['file-id'], defaultName, defaultMime)
+              }
+
+              // Tier 3: rawEvent fallback (single-message only, NOT media groups)
+              if (!data && session.platform === 'telegram' && !(session.event as any)?._data?.mediaGroup) {
+                logger.debug(`Tier 3 fallback: rawEvent extraction for element ${el.type}`)
                 const rawEvent = (session.event as any)?._data?.message || (session.event as any)?._data
                 const fileId =
                   rawEvent?.photo?.[rawEvent.photo.length - 1]?.file_id ||
@@ -989,6 +1018,10 @@ export function apply(ctx: Context, config: Config) {
                 const mimeType = rawEvent?.document?.mime_type || rawEvent?.audio?.mime_type || rawEvent?.video?.mime_type
                   || (isPhoto ? 'image/jpeg' : isVoice ? 'audio/ogg' : isAudio ? 'audio/mpeg' : isVideo ? 'video/mp4' : 'application/octet-stream')
                 if (fileId) data = await downloadTelegramFile(session, fileId, fileName, mimeType)
+              }
+
+              if (!data) {
+                logger.warn(`Failed to extract file from element ${el.type}, src=${src?.substring(0, 40)}, file-id=${el.attrs?.['file-id']}`)
               }
               if (data) files.push(data)
               break
