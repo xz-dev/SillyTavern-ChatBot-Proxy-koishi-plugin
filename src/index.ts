@@ -1,4 +1,5 @@
 import { Context, Schema, h, Logger } from 'koishi'
+import { createHash } from 'crypto'
 import type { IncomingMessage } from 'http'
 import type WebSocket from 'ws'
 import type { RawData } from 'ws'
@@ -907,6 +908,28 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.on('dispose', () => { msgIdCache.clear() })
 
+  // Per-channel TTS dedup: messageId → audio content hash
+  const TTS_DEDUP_MAX = 500
+  const ttsDedup = new Map<string, Map<number, string>>()
+
+  function isDuplicateTts(channelKey: string, messageId: number, audio: string): boolean {
+    const hash = createHash('md5').update(audio).digest('hex')
+    let map = ttsDedup.get(channelKey)
+    if (!map) {
+      map = new Map()
+      ttsDedup.set(channelKey, map)
+    }
+    if (map.get(messageId) === hash) return true
+    map.set(messageId, hash)
+    if (map.size > TTS_DEDUP_MAX) {
+      const oldest = map.keys().next().value
+      if (oldest !== undefined) map.delete(oldest)
+    }
+    return false
+  }
+
+  ctx.on('dispose', () => { ttsDedup.clear() })
+
   async function getBindingsForChat(chatId: string): Promise<STBinding[]> {
     return ctx.database.get('st_bindings', { stChatId: chatId })
   }
@@ -1015,6 +1038,12 @@ export function apply(ctx: Context, config: Config) {
 
       const bot = findBot(binding.platform)
       if (!bot) continue
+
+      // Dedup: skip if same audio for same messageId was already sent to this channel
+      if (msg.messageId != null && isDuplicateTts(key, msg.messageId, msg.audio)) {
+        logger.debug(`TTS dedup: skipping duplicate for msg #${msg.messageId} on ${key}`)
+        continue
+      }
 
       try {
         const audioBuffer = Buffer.from(msg.audio, 'base64')
