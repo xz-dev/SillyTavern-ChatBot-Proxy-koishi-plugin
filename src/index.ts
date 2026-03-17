@@ -133,6 +133,7 @@ interface STAiMessage {
   type: 'ai_message'
   chatId: string
   characterName: string
+  messageId: number
   content: {
     text: string
     images?: Array<{ data: string; mimeType: string }>
@@ -144,6 +145,7 @@ interface STAiTts {
   type: 'ai_tts'
   chatId: string
   characterName: string
+  messageId: number | null
   audio: string
   mimeType: string
   timestamp: number
@@ -732,11 +734,11 @@ export function apply(ctx: Context, config: Config) {
   }
 
   /** Send a message to a channel, releasing any typing lock first */
-  async function sendToChannel(platform: string, channelId: string, content: string) {
+  async function sendToChannel(platform: string, channelId: string, content: string): Promise<string[]> {
     stopTyping(`${platform}:${channelId}`)
     const bot = findBot(platform)
-    if (!bot) return
-    await bot.sendMessage(channelId, content)
+    if (!bot) return []
+    return await bot.sendMessage(channelId, content)
   }
 
   /** Broadcast a message to all bound channels, optionally filtered by platform */
@@ -886,6 +888,25 @@ export function apply(ctx: Context, config: Config) {
     typingLoopActive.clear()
   })
 
+  // Per-channel cache: stMsgId → platformMsgId (for TTS reply targeting)
+  const MSG_CACHE_MAX = 1000
+  const msgIdCache = new Map<string, Map<number, string>>()
+
+  function cacheMsgId(channelKey: string, stMsgId: number, platformMsgId: string) {
+    let map = msgIdCache.get(channelKey)
+    if (!map) {
+      map = new Map()
+      msgIdCache.set(channelKey, map)
+    }
+    map.set(stMsgId, platformMsgId)
+    if (map.size > MSG_CACHE_MAX) {
+      const oldest = map.keys().next().value
+      if (oldest !== undefined) map.delete(oldest)
+    }
+  }
+
+  ctx.on('dispose', () => { msgIdCache.clear() })
+
   async function getBindingsForChat(chatId: string): Promise<STBinding[]> {
     return ctx.database.get('st_bindings', { stChatId: chatId })
   }
@@ -968,9 +989,15 @@ export function apply(ctx: Context, config: Config) {
           if (text) {
             parts.push(text)
           }
-          await bot.sendMessage(binding.channelId, parts.join('\n'))
+          const sentIds = await bot.sendMessage(binding.channelId, parts.join('\n'))
+          if (sentIds?.length && msg.messageId != null) {
+            cacheMsgId(key, msg.messageId, sentIds[0])
+          }
         } else if (text) {
-          await sendToChannel(binding.platform, binding.channelId, text)
+          const sentIds = await sendToChannel(binding.platform, binding.channelId, text)
+          if (sentIds?.length && msg.messageId != null) {
+            cacheMsgId(key, msg.messageId, sentIds[0])
+          }
         }
       } catch (e) {
         logger.error(`Failed to broadcast AI message to ${key}:`, e)
@@ -1007,7 +1034,20 @@ export function apply(ctx: Context, config: Config) {
         }
         
         const audioUrl = `data:${mimeType};base64,${finalBuffer.toString('base64')}`
-        await bot.sendMessage(binding.channelId, h('audio', { url: audioUrl }).toString())
+        const audioElement = h('audio', { url: audioUrl }).toString()
+
+        // Reply to the corresponding text message if cached
+        let content: string
+        if (msg.messageId != null) {
+          const platformMsgId = msgIdCache.get(key)?.get(msg.messageId)
+          content = platformMsgId
+            ? h.quote(platformMsgId).toString() + audioElement
+            : audioElement
+        } else {
+          content = audioElement
+        }
+
+        await bot.sendMessage(binding.channelId, content)
       } catch (e) {
         logger.error(`Failed to broadcast TTS to ${key}:`, e)
       }
