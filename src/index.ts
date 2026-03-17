@@ -512,6 +512,7 @@ export function apply(ctx: Context, config: Config) {
         await broadcastAiTts(msg)
         break
       case 'generation_started': {
+        logger.debug(`generation_started received, chatId=${msg.chatId}`)
         const bindings = await getBindingsForChat(msg.chatId)
         for (const binding of bindings) {
           startTypingForChannel(binding.platform, binding.channelId)
@@ -519,6 +520,7 @@ export function apply(ctx: Context, config: Config) {
         break
       }
       case 'generation_ended': {
+        logger.debug(`generation_ended received, chatId=${msg.chatId}`)
         const bindings = await getBindingsForChat(msg.chatId)
         for (const binding of bindings) {
           stopTypingForChannel(binding.platform, binding.channelId)
@@ -712,8 +714,9 @@ export function apply(ctx: Context, config: Config) {
   // within 8s, the loop exits automatically.
   // ----------------------------------------------------------
 
-  const TYPING_INTERVAL = 4000    // resend typing every 4s (Telegram expires after 5s)
-  const HEARTBEAT_TIMEOUT = 8000  // stop typing if no heartbeat for 8s
+  const TYPING_INTERVAL = 4000      // resend typing every 4s (Telegram expires after 5s)
+  const HEARTBEAT_TIMEOUT = 8000    // stop typing if no heartbeat for 8s
+  const MAX_TYPING_DURATION = 180000 // safety: force stop after 3 minutes
 
   /** Per-channel heartbeat timestamp. 0 = default / explicit stop. */
   const typingHeartbeats = new Map<string, number>()
@@ -755,16 +758,23 @@ export function apply(ctx: Context, config: Config) {
 
     // Start typing loop (async, non-blocking)
     typingLoopActive.add(key)
+    logger.debug(`Typing loop started: ${key}`)
     ;(async () => {
+      const startTime = Date.now()
       while (true) {
         const lastHeartbeat = typingHeartbeats.get(key) ?? 0
-        if (Date.now() - lastHeartbeat >= HEARTBEAT_TIMEOUT) break
+        if (Date.now() - lastHeartbeat >= HEARTBEAT_TIMEOUT) {
+          logger.debug(`Typing loop exited (heartbeat timeout): ${key}`)
+          break
+        }
+        if (Date.now() - startTime >= MAX_TYPING_DURATION) {
+          logger.warn(`Typing loop force stopped (max duration ${MAX_TYPING_DURATION}ms): ${key}`)
+          break
+        }
         await sendTypingAction(bot, channelId)
         await new Promise(r => setTimeout(r, TYPING_INTERVAL))
       }
       typingLoopActive.delete(key)
-      // Note: heartbeat is NOT reset to 0 here.
-      // Only stopTypingForChannel sets it to 0 (explicit stop intent).
     })()
 
     return key
@@ -776,6 +786,7 @@ export function apply(ctx: Context, config: Config) {
    */
   function stopTypingForChannel(platform: string, channelId: string) {
     const key = `${platform}:${channelId}`
+    logger.debug(`Typing stop requested: ${key}`)
     typingHeartbeats.set(key, 0)
   }
 
