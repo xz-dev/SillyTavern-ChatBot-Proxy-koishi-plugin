@@ -6,6 +6,8 @@ export interface Config {
     wsPath: string;
     apiKey: string;
     showAiName: boolean;
+    notifyBotOnline: boolean;
+    notifySTOnline: boolean;
     pingInterval: number;
 }
 export declare const Config: Schema<Config>;

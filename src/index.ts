@@ -25,6 +25,8 @@ export interface Config {
   wsPath: string
   apiKey: string
   showAiName: boolean
+  notifyBotOnline: boolean
+  notifySTOnline: boolean
   pingInterval: number
 }
 
@@ -39,6 +41,12 @@ export const Config: Schema<Config> = Schema.object({
   showAiName: Schema.boolean()
     .default(true)
     .description('Show AI character name as a header before messages'),
+  notifyBotOnline: Schema.boolean()
+    .default(true)
+    .description('Send notification when bot comes online'),
+  notifySTOnline: Schema.boolean()
+    .default(true)
+    .description('Send notification when SillyTavern connects/disconnects'),
   pingInterval: Schema.number()
     .default(10)
     .min(1)
@@ -405,7 +413,9 @@ export function apply(ctx: Context, config: Config) {
     if (allClients.size === 0) {
       stopPingTimer()
       // Notify all bound channels
-      broadcastToAllChannels(sysMsg('SillyTavern offline'))
+      if (config.notifySTOnline) {
+        broadcastTemporary(sysMsg('SillyTavern offline'))
+      }
     }
   }
 
@@ -427,7 +437,9 @@ export function apply(ctx: Context, config: Config) {
     startPingTimer()
 
     // Notify all bound channels
-    broadcastToAllChannels(sysMsg('SillyTavern online'))
+    if (config.notifySTOnline) {
+      broadcastTemporary(sysMsg('SillyTavern online'))
+    }
 
     // RFC 6455: browser auto-replies pong to our ping
     socket.on('pong', () => {
@@ -482,7 +494,9 @@ export function apply(ctx: Context, config: Config) {
   ctx.on('bot-status-updated', (bot) => {
     if (bot.status === 1 /* Status.ONLINE */) {
       logger.info(`Bot ${bot.platform} is online, notifying bound channels`)
-      broadcastToAllChannels(sysMsg("I'm back online — ready when you are."), bot.platform)
+      if (config.notifyBotOnline) {
+        broadcastTemporary(sysMsg("I'm back online — ready when you are."), 30000, bot.platform)
+      }
     }
   })
 
@@ -662,6 +676,34 @@ export function apply(ctx: Context, config: Config) {
     const bindings = await ctx.database.get('st_bindings', query)
     for (const b of bindings) {
       sendToChannel(b.platform, b.channelId, content).catch(() => {})
+    }
+  }
+
+  /** Send a message and auto-delete it after a delay (best-effort) */
+  async function sendTemporary(platform: string, channelId: string, content: string, deleteAfterMs = 30000) {
+    const bot = findBot(platform)
+    if (!bot) return
+    try {
+      const msgIds = await bot.sendMessage(channelId, content)
+      if (msgIds?.length) {
+        setTimeout(async () => {
+          for (const id of msgIds) {
+            try { await bot.deleteMessage(channelId, id) } catch { /* best effort */ }
+          }
+        }, deleteAfterMs)
+      }
+    } catch {
+      // best effort
+    }
+  }
+
+  /** Broadcast a temporary message to all bound channels, auto-deleted after delay */
+  async function broadcastTemporary(content: string, deleteAfterMs = 30000, platformFilter?: string) {
+    const query: any = {}
+    if (platformFilter) query.platform = platformFilter
+    const bindings = await ctx.database.get('st_bindings', query)
+    for (const b of bindings) {
+      sendTemporary(b.platform, b.channelId, content, deleteAfterMs)
     }
   }
 
@@ -1157,12 +1199,18 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.command('st.config <key:string> [value:string]', 'View or update bridge configuration')
     .alias('st-config')
-    .usage('Usage: st.config <key> [value]\nKeys: ping <seconds>, ainame <true|false>')
+    .usage('Usage: st.config <key> [value]\nKeys: ping, ainame, botonline, stonline')
     .example('st.config ping 5')
     .example('st.config ainame false')
     .action(async ({ session }, key, value) => {
       if (!key) {
-        return sysMsg(`Current config:\n  ping: ${config.pingInterval}s\n  ainame: ${config.showAiName}`)
+        return sysMsg([
+          'Current config:',
+          `  ping: ${config.pingInterval}s`,
+          `  ainame: ${config.showAiName}`,
+          `  botonline: ${config.notifyBotOnline}`,
+          `  stonline: ${config.notifySTOnline}`,
+        ].join('\n'))
       }
 
       if (key === 'ping') {
@@ -1174,7 +1222,6 @@ export function apply(ctx: Context, config: Config) {
           return sysMsg('Invalid value. ping must be 1-300 seconds.')
         }
         config.pingInterval = seconds
-        // Restart ping timer with new interval
         if (allClients.size > 0) {
           startPingTimer()
         }
@@ -1194,7 +1241,31 @@ export function apply(ctx: Context, config: Config) {
         return sysMsg(`AI name display ${config.showAiName ? 'enabled' : 'disabled'} (saved)`)
       }
 
-      return sysMsg(`Unknown config key: ${key}\nAvailable keys: ping, ainame`)
+      if (key === 'botonline') {
+        if (!value) {
+          return sysMsg(`botonline: ${config.notifyBotOnline}`)
+        }
+        if (value !== 'true' && value !== 'false') {
+          return sysMsg('Invalid value. botonline must be true or false.')
+        }
+        config.notifyBotOnline = value === 'true'
+        ctx.scope.update(config)
+        return sysMsg(`Bot online notification ${config.notifyBotOnline ? 'enabled' : 'disabled'} (saved)`)
+      }
+
+      if (key === 'stonline') {
+        if (!value) {
+          return sysMsg(`stonline: ${config.notifySTOnline}`)
+        }
+        if (value !== 'true' && value !== 'false') {
+          return sysMsg('Invalid value. stonline must be true or false.')
+        }
+        config.notifySTOnline = value === 'true'
+        ctx.scope.update(config)
+        return sysMsg(`ST online notification ${config.notifySTOnline ? 'enabled' : 'disabled'} (saved)`)
+      }
+
+      return sysMsg(`Unknown config key: ${key}\nAvailable keys: ping, ainame, botonline, stonline`)
     })
 
   ctx.command('st.retry', 'Retry the last failed message to SillyTavern')
