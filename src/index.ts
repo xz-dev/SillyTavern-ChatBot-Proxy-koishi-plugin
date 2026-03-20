@@ -98,6 +98,7 @@ export const inject = {
 declare module 'koishi' {
   interface Tables {
     st_bindings: STBinding
+    st_status_msgs: STStatusMessage
   }
 }
 
@@ -109,6 +110,15 @@ export interface STBinding {
   stChatId: string
   createdAt: Date
   createdBy: string
+  lastMessageId: string
+}
+
+export interface STStatusMessage {
+  id: number
+  platform: string
+  channelId: string
+  messageId: string
+  category: string
 }
 
 // ============================================================
@@ -290,9 +300,33 @@ export function apply(ctx: Context, config: Config) {
     stChatId: 'string',
     createdAt: 'timestamp',
     createdBy: 'string',
+    lastMessageId: 'string',
   }, {
     autoInc: true,
     unique: [['platform', 'channelId']],
+  })
+
+  ctx.model.extend('st_status_msgs', {
+    id: 'unsigned',
+    platform: 'string',
+    channelId: 'string',
+    messageId: 'string',
+    category: 'string',
+  }, {
+    autoInc: true,
+  })
+
+  // Load persisted lastMessageId from DB into memory on startup
+  ctx.on('ready', async () => {
+    const bindings = await ctx.database.get('st_bindings', {})
+    for (const b of bindings) {
+      if (b.lastMessageId) {
+        lastSeenMessageId.set(`${b.platform}:${b.channelId}`, b.lastMessageId)
+      }
+    }
+    if (lastSeenMessageId.size) {
+      logger.info(`Loaded lastMessageId for ${lastSeenMessageId.size} channel(s) from DB`)
+    }
   })
 
   // ----------------------------------------------------------
@@ -320,11 +354,6 @@ export function apply(ctx: Context, config: Config) {
   /** Last processed message ID per bound channel. Key = "platform:channelId" */
   const lastSeenMessageId = new Map<string, string>()
   const MAX_RECOVERY_MESSAGES = 50
-
-  // --- ST offline message tracking ---
-  /** Tracks "SillyTavern offline" notification msg IDs for deferred deletion.
-   *  Key = "platform:channelId", Value = messageId[] */
-  const stOfflineMsgIds = new Map<string, string[]>()
 
   /** Send a message to the active ST client */
   function sendToST(msg: KoishiDownstreamMessage): boolean {
@@ -430,7 +459,7 @@ export function apply(ctx: Context, config: Config) {
       stopPingTimer()
       // Send persistent offline notification (deleted when ST reconnects)
       if (config.notifySTOnline) {
-        sendSTOfflineNotifications()
+        broadcastStatusNotification('st_offline', 'SillyTavern offline')
       }
     }
   }
@@ -452,10 +481,9 @@ export function apply(ctx: Context, config: Config) {
     logger.info(`ST client connected. Total: ${allClients.size}, using latest.`)
     startPingTimer()
 
-    // Notify all bound channels — first clean up "ST offline" messages, then send "ST online"
+    // Notify all bound channels — delete "ST offline" messages, send "ST online"
     if (config.notifySTOnline) {
-      deleteSTOfflineNotifications()
-      broadcastTemporary('SillyTavern online', 30000, undefined, true)
+      broadcastStatusNotification('st_online', 'SillyTavern online', undefined, ['st_offline'])
     }
 
     // RFC 6455: browser auto-replies pong to our ping
@@ -507,9 +535,8 @@ export function apply(ctx: Context, config: Config) {
     botOfflineTimers.clear()
     botOfflineAt.clear()
 
-    // Clean up message tracking state
+    // Clean up in-memory caches
     lastSeenMessageId.clear()
-    stOfflineMsgIds.clear()
   })
 
   // ----------------------------------------------------------
@@ -539,7 +566,7 @@ export function apply(ctx: Context, config: Config) {
         // Was offline longer than grace period — genuine reconnect
         logger.info(`Bot ${sid} is back online after outage, notifying bound channels`)
         if (config.notifyBotOnline) {
-          broadcastTemporary("I'm back online — ready when you are.", 30000, bot.platform, true)
+          broadcastStatusNotification('bot_online', "I'm back online — ready when you are.", bot.platform)
         }
         // Recover messages sent while bot was offline
         recoverMissedMessages(bot).catch(e => logger.warn('Missed message recovery failed:', e))
@@ -548,7 +575,7 @@ export function apply(ctx: Context, config: Config) {
         // First-time online (no recorded offline) — normal startup
         logger.info(`Bot ${sid} is online`)
         if (config.notifyBotOnline) {
-          broadcastTemporary("I'm back online — ready when you are.", 30000, bot.platform, true)
+          broadcastStatusNotification('bot_online', "I'm back online — ready when you are.", bot.platform)
         }
       }
     } else if (bot.status === Universal.Status.OFFLINE || bot.status === Universal.Status.DISCONNECT) {
@@ -950,37 +977,76 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
+  // ----------------------------------------------------------
+  // DB-backed Status Notifications
+  //
+  // Every status notification (bot_online, st_online, st_offline)
+  // is tracked in st_status_msgs so that old notifications can
+  // be deleted even after a server restart/crash.
+  // ----------------------------------------------------------
+
   /**
-   * Send persistent (non-temporary) "SillyTavern offline" notifications to all
-   * bound channels and store their message IDs for later deletion on reconnect.
-   * Fire-and-forget — errors are handled within sendMuted().
+   * Send a status notification to a single channel, replacing any previous
+   * notification of the same category (and optionally extra categories).
+   * Message IDs are persisted in DB so cleanup survives restarts.
    */
-  async function sendSTOfflineNotifications() {
-    const bindings = await ctx.database.get('st_bindings', {})
-    for (const b of bindings) {
-      const ids = await sendMuted(b.platform, b.channelId, 'SillyTavern offline')
-      if (ids.length) {
-        stOfflineMsgIds.set(`${b.platform}:${b.channelId}`, ids)
-      }
+  async function sendStatusNotification(
+    category: string,
+    platform: string,
+    channelId: string,
+    text: string,
+    alsoDeleteCategories?: string[],
+  ) {
+    const bot = findBot(platform)
+    if (!bot) return
+
+    // 1. Find old notifications to clean up
+    const cats = [category, ...(alsoDeleteCategories || [])]
+    const oldMsgs = await ctx.database.get('st_status_msgs', {
+      platform, channelId, category: { $in: cats },
+    })
+
+    // 2. Delete old platform messages (best-effort)
+    for (const old of oldMsgs) {
+      bot.deleteMessage(channelId, old.messageId).catch(() => {})
+    }
+
+    // 3. Remove old DB records
+    if (oldMsgs.length) {
+      await ctx.database.remove('st_status_msgs', {
+        platform, channelId, category: { $in: cats },
+      })
+    }
+
+    // 4. Send new muted notification
+    const msgIds = await sendMuted(platform, channelId, text)
+
+    // 5. Persist new message IDs
+    for (const messageId of msgIds) {
+      await ctx.database.create('st_status_msgs', {
+        platform, channelId, messageId, category,
+      })
     }
   }
 
   /**
-   * Delete all tracked "SillyTavern offline" notification messages.
-   * Called when ST reconnects, before sending the "SillyTavern online" notification.
+   * Broadcast a status notification to all bound channels,
+   * optionally filtered by platform. Replaces old notifications
+   * of the same category in each channel.
    */
-  function deleteSTOfflineNotifications() {
-    for (const [key, ids] of stOfflineMsgIds) {
-      const [platform, ...rest] = key.split(':')
-      const channelId = rest.join(':') // channelId may contain colons
-      const bot = findBot(platform)
-      if (bot) {
-        for (const id of ids) {
-          bot.deleteMessage(channelId, id).catch(() => { /* best effort */ })
-        }
-      }
+  async function broadcastStatusNotification(
+    category: string,
+    text: string,
+    platformFilter?: string,
+    alsoDeleteCategories?: string[],
+  ) {
+    const query: any = {}
+    if (platformFilter) query.platform = platformFilter
+    const bindings = await ctx.database.get('st_bindings', query)
+    for (const b of bindings) {
+      sendStatusNotification(category, b.platform, b.channelId, text, alsoDeleteCategories)
+        .catch(e => logger.warn(`sendStatusNotification failed for ${b.platform}:${b.channelId}:`, e))
     }
-    stOfflineMsgIds.clear()
   }
 
   // ----------------------------------------------------------
@@ -1372,9 +1438,13 @@ export function apply(ctx: Context, config: Config) {
         senderName,
       }
 
-      // Track last seen message ID for offline recovery
+      // Track last seen message ID for offline recovery (memory + DB)
       if (session.messageId) {
         lastSeenMessageId.set(sourceChannelKey, session.messageId)
+        ctx.database.set('st_bindings', {
+          platform: session.platform,
+          channelId: session.channelId,
+        }, { lastMessageId: session.messageId }).catch(() => {})
       }
 
       // Track for potential retry
@@ -1483,6 +1553,14 @@ export function apply(ctx: Context, config: Config) {
       if (!removed.matched) {
         return sysMsg('This channel is not bound to any SillyTavern chat.')
       }
+
+      // Clean up status notification records and in-memory cache
+      await ctx.database.remove('st_status_msgs', {
+        platform: session.platform,
+        channelId: session.channelId,
+      })
+      lastSeenMessageId.delete(`${session.platform}:${session.channelId}`)
+
       return sysMsg('Unbound from SillyTavern chat.')
     })
 

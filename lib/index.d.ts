@@ -17,6 +17,7 @@ export declare const inject: {
 declare module 'koishi' {
     interface Tables {
         st_bindings: STBinding;
+        st_status_msgs: STStatusMessage;
     }
 }
 export interface STBinding {
@@ -27,6 +28,14 @@ export interface STBinding {
     stChatId: string;
     createdAt: Date;
     createdBy: string;
+    lastMessageId: string;
+}
+export interface STStatusMessage {
+    id: number;
+    platform: string;
+    channelId: string;
+    messageId: string;
+    category: string;
 }
 export declare function apply(ctx: Context, config: Config): void;
 //# sourceMappingURL=index.d.ts.map
