@@ -483,7 +483,7 @@ export function apply(ctx: Context, config: Config) {
 
     // Notify all bound channels — delete "ST offline" messages, send "ST online"
     if (config.notifySTOnline) {
-      broadcastStatusNotification('st_online', 'SillyTavern online', undefined, ['st_offline'])
+      broadcastStatusNotification('st_online', 'SillyTavern online', undefined, ['st_offline'], 30000)
     }
 
     // RFC 6455: browser auto-replies pong to our ping
@@ -566,7 +566,7 @@ export function apply(ctx: Context, config: Config) {
         // Was offline longer than grace period — genuine reconnect
         logger.info(`Bot ${sid} is back online after outage, notifying bound channels`)
         if (config.notifyBotOnline) {
-          broadcastStatusNotification('bot_online', "I'm back online — ready when you are.", bot.platform)
+          broadcastStatusNotification('bot_online', "I'm back online — ready when you are.", bot.platform, undefined, 30000)
         }
         // Recover messages sent while bot was offline
         recoverMissedMessages(bot).catch(e => logger.warn('Missed message recovery failed:', e))
@@ -575,7 +575,7 @@ export function apply(ctx: Context, config: Config) {
         // First-time online (no recorded offline) — normal startup
         logger.info(`Bot ${sid} is online`)
         if (config.notifyBotOnline) {
-          broadcastStatusNotification('bot_online', "I'm back online — ready when you are.", bot.platform)
+          broadcastStatusNotification('bot_online', "I'm back online — ready when you are.", bot.platform, undefined, 30000)
         }
       }
     } else if (bot.status === Universal.Status.OFFLINE || bot.status === Universal.Status.DISCONNECT) {
@@ -996,6 +996,7 @@ export function apply(ctx: Context, config: Config) {
     channelId: string,
     text: string,
     alsoDeleteCategories?: string[],
+    autoDeleteMs?: number,
   ) {
     const bot = findBot(platform)
     if (!bot) return
@@ -1027,6 +1028,20 @@ export function apply(ctx: Context, config: Config) {
         platform, channelId, messageId, category,
       })
     }
+
+    // 6. Auto-delete after delay (DB record cleaned up too, so crash recovery won't re-delete)
+    if (autoDeleteMs && msgIds.length) {
+      setTimeout(async () => {
+        const b = findBot(platform)
+        if (!b) return
+        for (const id of msgIds) {
+          b.deleteMessage(channelId, id).catch(() => {})
+        }
+        ctx.database.remove('st_status_msgs', {
+          platform, channelId, messageId: { $in: msgIds },
+        }).catch(() => {})
+      }, autoDeleteMs)
+    }
   }
 
   /**
@@ -1039,12 +1054,13 @@ export function apply(ctx: Context, config: Config) {
     text: string,
     platformFilter?: string,
     alsoDeleteCategories?: string[],
+    autoDeleteMs?: number,
   ) {
     const query: any = {}
     if (platformFilter) query.platform = platformFilter
     const bindings = await ctx.database.get('st_bindings', query)
     for (const b of bindings) {
-      sendStatusNotification(category, b.platform, b.channelId, text, alsoDeleteCategories)
+      sendStatusNotification(category, b.platform, b.channelId, text, alsoDeleteCategories, autoDeleteMs)
         .catch(e => logger.warn(`sendStatusNotification failed for ${b.platform}:${b.channelId}:`, e))
     }
   }
