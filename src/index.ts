@@ -1,4 +1,4 @@
-import { Context, Schema, h, Logger } from 'koishi'
+import { Context, Schema, h, Logger, Universal } from 'koishi'
 import { createHash } from 'crypto'
 import type { IncomingMessage } from 'http'
 import type WebSocket from 'ws'
@@ -309,6 +309,23 @@ export function apply(ctx: Context, config: Config) {
   /** Stores the last failed message per channel for st.retry */
   const lastFailedMessage = new Map<string, KoishiSendCombinedMessage>()
 
+  // --- Bot offline/online debounce state ---
+  const RECONNECT_GRACE_PERIOD = 5000
+  /** Pending offline notification timers, keyed by bot.sid */
+  const botOfflineTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  /** Track when each bot went offline (epoch ms), keyed by bot.sid */
+  const botOfflineAt = new Map<string, number>()
+
+  // --- Missed message recovery state ---
+  /** Last processed message ID per bound channel. Key = "platform:channelId" */
+  const lastSeenMessageId = new Map<string, string>()
+  const MAX_RECOVERY_MESSAGES = 50
+
+  // --- ST offline message tracking ---
+  /** Tracks "SillyTavern offline" notification msg IDs for deferred deletion.
+   *  Key = "platform:channelId", Value = messageId[] */
+  const stOfflineMsgIds = new Map<string, string[]>()
+
   /** Send a message to the active ST client */
   function sendToST(msg: KoishiDownstreamMessage): boolean {
     if (!activeClient || activeClient.readyState !== 1) {
@@ -411,9 +428,9 @@ export function apply(ctx: Context, config: Config) {
     logger.info(`ST client cleaned up. Remaining: ${allClients.size}`)
     if (allClients.size === 0) {
       stopPingTimer()
-      // Notify all bound channels
+      // Send persistent offline notification (deleted when ST reconnects)
       if (config.notifySTOnline) {
-        broadcastTemporary('SillyTavern offline', 30000, undefined, true)
+        sendSTOfflineNotifications()
       }
     }
   }
@@ -435,8 +452,9 @@ export function apply(ctx: Context, config: Config) {
     logger.info(`ST client connected. Total: ${allClients.size}, using latest.`)
     startPingTimer()
 
-    // Notify all bound channels
+    // Notify all bound channels — first clean up "ST offline" messages, then send "ST online"
     if (config.notifySTOnline) {
+      deleteSTOfflineNotifications()
       broadcastTemporary('SillyTavern online', 30000, undefined, true)
     }
 
@@ -483,21 +501,148 @@ export function apply(ctx: Context, config: Config) {
     allClients.clear()
     clientAlive.clear()
     activeClient = null
+
+    // Clean up bot offline debounce timers
+    for (const timer of botOfflineTimers.values()) clearTimeout(timer)
+    botOfflineTimers.clear()
+    botOfflineAt.clear()
+
+    // Clean up message tracking state
+    lastSeenMessageId.clear()
+    stOfflineMsgIds.clear()
   })
 
   // ----------------------------------------------------------
-  // Status Notifications (event-driven)
+  // Status Notifications (event-driven, with 5s debounce)
+  //
+  // When a bot goes offline, we start a grace period timer.
+  // If the bot reconnects within the grace period, we suppress
+  // both offline logging and online notifications (brief blip).
+  // If it stays offline beyond the grace period, we log it.
+  // On genuine reconnect (after grace period), we send a
+  // notification and attempt to recover missed messages.
   // ----------------------------------------------------------
 
-  // Bot comes online → notify all bound channels on that platform
-  ctx.on('bot-status-updated', (bot) => {
-    if (bot.status === 1 /* Status.ONLINE */) {
-      logger.info(`Bot ${bot.platform} is online, notifying bound channels`)
-      if (config.notifyBotOnline) {
-        broadcastTemporary("I'm back online — ready when you are.", 30000, bot.platform, true)
+  ctx.on('login-updated', (session) => {
+    const bot = session.bot
+    const sid = bot.sid
+
+    if (bot.status === Universal.Status.ONLINE) {
+      const timer = botOfflineTimers.get(sid)
+      if (timer) {
+        // Reconnected within grace period — suppress all notifications
+        clearTimeout(timer)
+        botOfflineTimers.delete(sid)
+        botOfflineAt.delete(sid)
+        logger.info(`Bot ${sid} reconnected within ${RECONNECT_GRACE_PERIOD}ms, suppressing notifications`)
+      } else if (botOfflineAt.has(sid)) {
+        // Was offline longer than grace period — genuine reconnect
+        logger.info(`Bot ${sid} is back online after outage, notifying bound channels`)
+        if (config.notifyBotOnline) {
+          broadcastTemporary("I'm back online — ready when you are.", 30000, bot.platform, true)
+        }
+        // Recover messages sent while bot was offline
+        recoverMissedMessages(bot).catch(e => logger.warn('Missed message recovery failed:', e))
+        botOfflineAt.delete(sid)
+      } else {
+        // First-time online (no recorded offline) — normal startup
+        logger.info(`Bot ${sid} is online`)
+        if (config.notifyBotOnline) {
+          broadcastTemporary("I'm back online — ready when you are.", 30000, bot.platform, true)
+        }
       }
+    } else if (bot.status === Universal.Status.OFFLINE || bot.status === Universal.Status.DISCONNECT) {
+      if (!botOfflineTimers.has(sid)) {
+        botOfflineAt.set(sid, Date.now())
+        logger.info(`Bot ${sid} went offline, starting ${RECONNECT_GRACE_PERIOD}ms grace period`)
+        const timer = setTimeout(() => {
+          botOfflineTimers.delete(sid)
+          logger.warn(`Bot ${sid} confirmed offline (grace period expired)`)
+        }, RECONNECT_GRACE_PERIOD)
+        botOfflineTimers.set(sid, timer)
+      }
+    } else if (bot.status === Universal.Status.RECONNECT) {
+      logger.info(`Bot ${sid} is reconnecting...`)
     }
   })
+
+  // ----------------------------------------------------------
+  // Missed Message Recovery
+  //
+  // When a bot reconnects after an outage, iterate recent
+  // channel messages (newest-first via getMessageIter) until
+  // we reach the last message we processed before going offline.
+  // Bundle missed messages with ISO 8601 timestamps and forward
+  // them to ST as a single combined message per channel.
+  // ----------------------------------------------------------
+
+  async function recoverMissedMessages(bot: any) {
+    if (!activeClient || activeClient.readyState !== 1) {
+      logger.info('ST not connected, skipping missed message recovery')
+      return
+    }
+
+    const bindings = await ctx.database.get('st_bindings', { platform: bot.platform })
+    if (!bindings.length) return
+
+    for (const binding of bindings) {
+      const channelKey = `${binding.platform}:${binding.channelId}`
+      const lastId = lastSeenMessageId.get(channelKey)
+      if (!lastId) continue // Never processed a message here — skip
+
+      try {
+        const missed: Array<{ sender: string; text: string; time: string }> = []
+
+        for await (const msg of bot.getMessageIter(binding.channelId)) {
+          // Stop when we reach the last message we already processed
+          if (msg.id === lastId) break
+          // Skip bot's own messages
+          if (msg.user?.id === bot.selfId) continue
+          // Safety limit
+          if (missed.length >= MAX_RECOVERY_MESSAGES) break
+
+          const sender = msg.user?.name || msg.user?.nick || msg.user?.id || 'Unknown'
+          const content = msg.content || msg.elements?.map((e: any) => {
+            if (e.type === 'text') return e.attrs?.content || ''
+            if (e.type === 'img' || e.type === 'image') return '[Image]'
+            if (e.type === 'audio' || e.type === 'voice' || e.type === 'record') return '[Audio]'
+            if (e.type === 'video') return '[Video]'
+            if (e.type === 'file') return '[File]'
+            return ''
+          }).join('') || '[empty]'
+
+          const timestamp = msg.createdAt || msg.timestamp || Date.now()
+          missed.push({ sender, text: content, time: toLocalISO(timestamp) })
+        }
+
+        if (!missed.length) continue
+
+        // getMessageIter yields newest-first; reverse for chronological order
+        missed.reverse()
+
+        // Update lastSeenMessageId to the newest recovered message
+        // (first item before reverse = newest = missed[missed.length - 1] after reverse is wrong,
+        //  but we can just leave it — the next real message from middleware will update it)
+
+        const bundled = missed.map(m => `[${m.time}] ${m.sender}: ${m.text}`).join('\n')
+        const header = `--- ${missed.length} message(s) received while bot was offline ---`
+
+        const msg: KoishiSendCombinedMessage = {
+          type: 'send_combined_message',
+          chatId: binding.stChatId,
+          text: `${header}\n${bundled}`,
+          files: [],
+          sourceChannelKey: channelKey,
+          senderName: '[System: Offline Recovery]',
+        }
+        sendToST(msg)
+        logger.info(`Recovered ${missed.length} missed message(s) for ${channelKey}`)
+      } catch (e) {
+        // getMessageIter not supported by this adapter, or other error — not fatal
+        logger.debug(`Could not recover messages for ${channelKey}: ${e}`)
+      }
+    }
+  }
 
   // ----------------------------------------------------------
   // Handle messages from ST
@@ -653,8 +798,7 @@ export function apply(ctx: Context, config: Config) {
   // ----------------------------------------------------------
 
   function findBot(platform: string) {
-    // Status.ONLINE = 1 (const enum from @satorijs/protocol)
-    return ctx.bots.find(b => b.platform === platform && b.status === 1 /* Status.ONLINE */)
+    return ctx.bots.find(b => b.platform === platform && b.status === Universal.Status.ONLINE)
   }
 
   /** Wrap text in a blockquote element for system/header messages */
@@ -665,6 +809,21 @@ export function apply(ctx: Context, config: Config) {
   /** Escape HTML special characters for Telegram HTML parse mode */
   function escapeHtml(text: string): string {
     return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  }
+
+  /** Format a timestamp as ISO 8601 with the server's local timezone offset */
+  function toLocalISO(ts: number): string {
+    const d = new Date(ts)
+    const off = -d.getTimezoneOffset() // minutes ahead of UTC
+    const sign = off >= 0 ? '+' : '-'
+    const pad = (n: number) => String(Math.abs(n)).padStart(2, '0')
+    return d.getFullYear()
+      + '-' + pad(d.getMonth() + 1)
+      + '-' + pad(d.getDate())
+      + 'T' + pad(d.getHours())
+      + ':' + pad(d.getMinutes())
+      + ':' + pad(d.getSeconds())
+      + sign + pad(Math.floor(Math.abs(off) / 60)) + ':' + pad(Math.abs(off) % 60)
   }
 
   /**
@@ -789,6 +948,39 @@ export function apply(ctx: Context, config: Config) {
     for (const b of bindings) {
       sendTemporary(b.platform, b.channelId, content, deleteAfterMs, muted)
     }
+  }
+
+  /**
+   * Send persistent (non-temporary) "SillyTavern offline" notifications to all
+   * bound channels and store their message IDs for later deletion on reconnect.
+   * Fire-and-forget — errors are handled within sendMuted().
+   */
+  async function sendSTOfflineNotifications() {
+    const bindings = await ctx.database.get('st_bindings', {})
+    for (const b of bindings) {
+      const ids = await sendMuted(b.platform, b.channelId, 'SillyTavern offline')
+      if (ids.length) {
+        stOfflineMsgIds.set(`${b.platform}:${b.channelId}`, ids)
+      }
+    }
+  }
+
+  /**
+   * Delete all tracked "SillyTavern offline" notification messages.
+   * Called when ST reconnects, before sending the "SillyTavern online" notification.
+   */
+  function deleteSTOfflineNotifications() {
+    for (const [key, ids] of stOfflineMsgIds) {
+      const [platform, ...rest] = key.split(':')
+      const channelId = rest.join(':') // channelId may contain colons
+      const bot = findBot(platform)
+      if (bot) {
+        for (const id of ids) {
+          bot.deleteMessage(channelId, id).catch(() => { /* best effort */ })
+        }
+      }
+    }
+    stOfflineMsgIds.clear()
   }
 
   // ----------------------------------------------------------
@@ -1178,6 +1370,11 @@ export function apply(ctx: Context, config: Config) {
         files,
         sourceChannelKey,
         senderName,
+      }
+
+      // Track last seen message ID for offline recovery
+      if (session.messageId) {
+        lastSeenMessageId.set(sourceChannelKey, session.messageId)
       }
 
       // Track for potential retry
