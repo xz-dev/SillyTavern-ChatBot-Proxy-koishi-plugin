@@ -148,6 +148,7 @@ interface STAiMessage {
   content: {
     text: string
     images?: Array<{ data: string; mimeType: string }>
+    reasoning?: string
   }
   timestamp: number
 }
@@ -928,6 +929,85 @@ export function apply(ctx: Context, config: Config) {
     return await bot.sendMessage(channelId, content)
   }
 
+  /**
+   * Send an AI message with reasoning/thinking content using platform-native APIs.
+   * Formats reasoning differently per platform for optimal display.
+   * Caller is responsible for calling stopTyping() before invoking this.
+   */
+  async function sendAiMessageWithReasoning(
+    platform: string, channelId: string, bot: any,
+    nameHeader: string, reasoning: string, bodyText: string,
+  ): Promise<string[]> {
+    try {
+      switch (platform) {
+        case 'telegram': {
+          const parts: string[] = []
+          if (nameHeader) parts.push(`<blockquote>${escapeHtml(nameHeader)}</blockquote>`)
+          parts.push(`<blockquote expandable>Thinking:\n${escapeHtml(reasoning)}</blockquote>`)
+          if (bodyText) parts.push(escapeHtml(bodyText))
+          const result = await (bot as any).internal.sendMessage({
+            chat_id: channelId,
+            text: parts.join('\n'),
+            parse_mode: 'HTML',
+          })
+          return [String(result.message_id)]
+        }
+        case 'discord': {
+          const parts: string[] = []
+          if (nameHeader) parts.push(`> ${nameHeader}`)
+          const reasoningLines = reasoning.split('\n')
+            .map(l => l ? `> *${l.replace(/\*/g, '\\*')}*` : '>')
+            .join('\n')
+          parts.push(`> *Thinking:*\n${reasoningLines}`)
+          if (bodyText) {
+            parts.push('') // empty line to end blockquote
+            parts.push(bodyText)
+          }
+          const result = await (bot as any).internal.createMessage(channelId, {
+            content: parts.join('\n'),
+          })
+          return [result.id]
+        }
+        case 'matrix': {
+          const txnId = `m${Date.now()}${Math.random().toString(36).slice(2, 6)}`
+          const htmlParts: string[] = []
+          const plainParts: string[] = []
+          if (nameHeader) {
+            htmlParts.push(`<blockquote>${escapeHtml(nameHeader)}</blockquote>`)
+            plainParts.push(`> ${nameHeader}`)
+          }
+          htmlParts.push(`<blockquote><em style="color:gray">Thinking:\n${escapeHtml(reasoning)}</em></blockquote>`)
+          plainParts.push(`> Thinking:\n${reasoning}`)
+          if (bodyText) {
+            htmlParts.push(escapeHtml(bodyText))
+            plainParts.push(bodyText)
+          }
+          const result = await (bot as any).http.put(
+            `/client/v3/rooms/${encodeURIComponent(channelId)}/send/m.room.message/${txnId}`,
+            {
+              msgtype: 'm.text',
+              body: plainParts.join('\n'),
+              format: 'org.matrix.custom.html',
+              formatted_body: htmlParts.join('\n'),
+            },
+          )
+          return [(result as any).event_id]
+        }
+        default: {
+          // Satori fallback: quote + italic
+          const parts: string[] = []
+          if (nameHeader) parts.push(sysMsg(nameHeader))
+          parts.push(`<quote><i>Thinking:\n${reasoning}</i></quote>`)
+          if (bodyText) parts.push(bodyText)
+          return await bot.sendMessage(channelId, parts.join('\n')) ?? []
+        }
+      }
+    } catch (e) {
+      logger.warn(`sendAiMessageWithReasoning failed on ${platform}:${channelId}:`, e)
+      return []
+    }
+  }
+
   /** Broadcast a message to all bound channels, optionally filtered by platform */
   async function broadcastToAllChannels(content: string, platformFilter?: string) {
     const query: any = {}
@@ -1261,6 +1341,9 @@ export function apply(ctx: Context, config: Config) {
     const bindings = await getBindingsForChat(msg.chatId)
     if (!bindings.length) return
 
+    // Filter: only include reasoning if it has non-whitespace content; preserve original (no trim)
+    const reasoning = msg.content.reasoning?.trim() ? msg.content.reasoning : ''
+
     for (const binding of bindings) {
       const key = `${binding.platform}:${binding.channelId}`
       stopTyping(key)
@@ -1269,31 +1352,54 @@ export function apply(ctx: Context, config: Config) {
       if (!bot) continue
 
       try {
-        const text = msg.content.text
-          ? (config.showAiName
-            ? `${sysMsg(`${msg.characterName}:`)}\n${msg.content.text}`
-            : msg.content.text)
-          : ''
+        const nameHeader = config.showAiName ? `${msg.characterName}:` : ''
+        const bodyText = msg.content.text || ''
         const hasImages = msg.content.images && msg.content.images.length > 0
 
-        if (hasImages) {
-          const parts: string[] = []
-          for (const img of msg.content.images!) {
-            parts.push(h('image', {
-              url: `data:${img.mimeType};base64,${img.data}`,
-            }).toString())
-          }
-          if (text) {
-            parts.push(text)
-          }
-          const sentIds = await bot.sendMessage(binding.channelId, parts.join('\n'))
+        if (reasoning && !hasImages) {
+          // Text-only with reasoning: use platform-native APIs for best formatting
+          const sentIds = await sendAiMessageWithReasoning(
+            binding.platform, binding.channelId, bot,
+            nameHeader, reasoning, bodyText,
+          )
           if (sentIds?.length && msg.messageId != null) {
             cacheMsgId(key, msg.messageId, sentIds[0])
           }
-        } else if (text) {
-          const sentIds = await sendToChannel(binding.platform, binding.channelId, text)
-          if (sentIds?.length && msg.messageId != null) {
-            cacheMsgId(key, msg.messageId, sentIds[0])
+        } else {
+          // Standard path: no reasoning, or images present (Satori-based)
+          let text: string
+          if (reasoning && hasImages) {
+            // Images + reasoning: use Satori formatting as fallback
+            const parts: string[] = []
+            if (nameHeader) parts.push(sysMsg(nameHeader))
+            parts.push(`<quote><i>Thinking:\n${reasoning}</i></quote>`)
+            if (bodyText) parts.push(bodyText)
+            text = parts.join('\n')
+          } else {
+            text = bodyText
+              ? (nameHeader ? `${sysMsg(nameHeader)}\n${bodyText}` : bodyText)
+              : ''
+          }
+
+          if (hasImages) {
+            const parts: string[] = []
+            for (const img of msg.content.images!) {
+              parts.push(h('image', {
+                url: `data:${img.mimeType};base64,${img.data}`,
+              }).toString())
+            }
+            if (text) {
+              parts.push(text)
+            }
+            const sentIds = await bot.sendMessage(binding.channelId, parts.join('\n'))
+            if (sentIds?.length && msg.messageId != null) {
+              cacheMsgId(key, msg.messageId, sentIds[0])
+            }
+          } else if (text) {
+            const sentIds = await sendToChannel(binding.platform, binding.channelId, text)
+            if (sentIds?.length && msg.messageId != null) {
+              cacheMsgId(key, msg.messageId, sentIds[0])
+            }
           }
         }
       } catch (e) {
