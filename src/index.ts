@@ -345,7 +345,7 @@ export function apply(ctx: Context, config: Config) {
   const lastFailedMessage = new Map<string, KoishiSendCombinedMessage>()
 
   // --- Bot offline/online debounce state ---
-  const RECONNECT_GRACE_PERIOD = 5000
+  const RECONNECT_GRACE_PERIOD = 30000
   /** Pending offline notification timers, keyed by bot.sid */
   const botOfflineTimers = new Map<string, ReturnType<typeof setTimeout>>()
   /** Track when each bot went offline (epoch ms), keyed by bot.sid */
@@ -541,7 +541,7 @@ export function apply(ctx: Context, config: Config) {
   })
 
   // ----------------------------------------------------------
-  // Status Notifications (event-driven, with 5s debounce)
+  // Status Notifications (event-driven, with 30s debounce)
   //
   // When a bot goes offline, we start a grace period timer.
   // If the bot reconnects within the grace period, we suppress
