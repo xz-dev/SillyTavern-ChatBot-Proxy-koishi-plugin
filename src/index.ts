@@ -1341,6 +1341,14 @@ export function apply(ctx: Context, config: Config) {
     const bindings = await getBindingsForChat(msg.chatId)
     if (!bindings.length) return
 
+    // Skip messages where AI only produced thinking/reasoning with no actual text or images
+    const hasText = !!msg.content.text?.trim()
+    const hasImages = !!(msg.content.images && msg.content.images.length > 0)
+    if (!hasText && !hasImages) {
+      logger.info('Skipping AI message with empty text content for chatId:', msg.chatId)
+      return
+    }
+
     // Filter: only include reasoning if it has non-whitespace content; preserve original (no trim)
     const reasoning = msg.content.reasoning?.trim() ? msg.content.reasoning : ''
 
@@ -1354,7 +1362,6 @@ export function apply(ctx: Context, config: Config) {
       try {
         const nameHeader = config.showAiName ? `${msg.characterName}:` : ''
         const bodyText = msg.content.text || ''
-        const hasImages = msg.content.images && msg.content.images.length > 0
 
         if (reasoning && !hasImages) {
           // Text-only with reasoning: use platform-native APIs for best formatting
