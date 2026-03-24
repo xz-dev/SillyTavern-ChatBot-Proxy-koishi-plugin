@@ -29,6 +29,7 @@ export interface Config {
   notifyBotOnline: boolean
   notifySTOnline: boolean
   pingInterval: number
+  reconnectNotifyTimeout: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -53,6 +54,9 @@ export const Config: Schema<Config> = Schema.object({
     .min(1)
     .max(300)
     .description('WebSocket ping interval in seconds (RFC 6455 protocol-level ping)'),
+  reconnectNotifyTimeout: Schema.number()
+    .default(30)
+    .description('Seconds to wait after disconnect before sending bot-online notification'),
 })
 
 import ffmpeg from 'fluent-ffmpeg'
@@ -345,7 +349,6 @@ export function apply(ctx: Context, config: Config) {
   const lastFailedMessage = new Map<string, KoishiSendCombinedMessage>()
 
   // --- Bot offline/online debounce state ---
-  const RECONNECT_GRACE_PERIOD = 30000
   /** Pending offline notification timers, keyed by bot.sid */
   const botOfflineTimers = new Map<string, ReturnType<typeof setTimeout>>()
   /** Track when each bot went offline (epoch ms), keyed by bot.sid */
@@ -541,7 +544,7 @@ export function apply(ctx: Context, config: Config) {
   })
 
   // ----------------------------------------------------------
-  // Status Notifications (event-driven, with 30s debounce)
+  // Status Notifications (event-driven, with configurable debounce)
   //
   // When a bot goes offline, we start a grace period timer.
   // If the bot reconnects within the grace period, we suppress
@@ -562,7 +565,7 @@ export function apply(ctx: Context, config: Config) {
         clearTimeout(timer)
         botOfflineTimers.delete(sid)
         botOfflineAt.delete(sid)
-        logger.info(`Bot ${sid} reconnected within ${RECONNECT_GRACE_PERIOD}ms, suppressing notifications`)
+        logger.info(`Bot ${sid} reconnected within ${config.reconnectNotifyTimeout}s, suppressing notifications`)
       } else if (botOfflineAt.has(sid)) {
         // Was offline longer than grace period — genuine reconnect
         logger.info(`Bot ${sid} is back online after outage, notifying bound channels`)
@@ -588,11 +591,12 @@ export function apply(ctx: Context, config: Config) {
       // ONLINE → RECONNECT → ONLINE without ever passing through DISCONNECT/OFFLINE.
       if (!botOfflineTimers.has(sid)) {
         botOfflineAt.set(sid, Date.now())
-        logger.info(`Bot ${sid} went offline (status=${bot.status}), starting ${RECONNECT_GRACE_PERIOD}ms grace period`)
+        const timeoutMs = config.reconnectNotifyTimeout * 1000
+        logger.info(`Bot ${sid} went offline (status=${bot.status}), starting ${config.reconnectNotifyTimeout}s grace period`)
         const timer = setTimeout(() => {
           botOfflineTimers.delete(sid)
           logger.warn(`Bot ${sid} confirmed offline (grace period expired)`)
-        }, RECONNECT_GRACE_PERIOD)
+        }, timeoutMs)
         botOfflineTimers.set(sid, timer)
       }
     }
@@ -1752,9 +1756,9 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.command('st.config <key:string> [value:string]', 'View or update bridge configuration')
     .alias('st-config')
-    .usage('Usage: st.config <key> [value]\nKeys: ping, ainame, botonline, stonline')
+    .usage('Usage: st.config <key> [value]\nKeys: ping, ainame, botonline, stonline, reconnectnotifytimeout')
     .example('st.config ping 5')
-    .example('st.config ainame false')
+    .example('st.config reconnectnotifytimeout 60')
     .action(async ({ session }, key, value) => {
       if (!key) {
         return sysMsg([
@@ -1763,6 +1767,7 @@ export function apply(ctx: Context, config: Config) {
           `  ainame: ${config.showAiName}`,
           `  botonline: ${config.notifyBotOnline}`,
           `  stonline: ${config.notifySTOnline}`,
+          `  reconnectnotifytimeout: ${config.reconnectNotifyTimeout}s`,
         ].join('\n'))
       }
 
@@ -1818,7 +1823,20 @@ export function apply(ctx: Context, config: Config) {
         return sysMsg(`ST online notification ${config.notifySTOnline ? 'enabled' : 'disabled'} (saved)`)
       }
 
-      return sysMsg(`Unknown config key: ${key}\nAvailable keys: ping, ainame, botonline, stonline`)
+      if (key === 'reconnectnotifytimeout') {
+        if (!value) {
+          return sysMsg(`reconnectnotifytimeout: ${config.reconnectNotifyTimeout}s`)
+        }
+        const seconds = parseInt(value, 10)
+        if (isNaN(seconds) || seconds < 0) {
+          return sysMsg('Invalid value. reconnectnotifytimeout must be a non-negative integer (seconds). 0 = always notify.')
+        }
+        config.reconnectNotifyTimeout = seconds
+        ctx.scope.update(config)
+        return sysMsg(`Reconnect notify timeout set to ${seconds}s (saved)`)
+      }
+
+      return sysMsg(`Unknown config key: ${key}\nAvailable keys: ping, ainame, botonline, stonline, reconnectnotifytimeout`)
     })
 
   ctx.command('st.retry', 'Retry the last failed message to SillyTavern')

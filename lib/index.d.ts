@@ -9,6 +9,7 @@ export interface Config {
     notifyBotOnline: boolean;
     notifySTOnline: boolean;
     pingInterval: number;
+    reconnectNotifyTimeout: number;
 }
 export declare const Config: Schema<Config>;
 export declare const inject: {
