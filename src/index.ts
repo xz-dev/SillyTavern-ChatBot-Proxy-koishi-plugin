@@ -579,18 +579,22 @@ export function apply(ctx: Context, config: Config) {
           broadcastStatusNotification('bot_online', "I'm back online — ready when you are.", bot.platform, undefined, 30000)
         }
       }
-    } else if (bot.status === Universal.Status.OFFLINE || bot.status === Universal.Status.DISCONNECT) {
+    } else if (
+      bot.status === Universal.Status.OFFLINE
+      || bot.status === Universal.Status.DISCONNECT
+      || bot.status === Universal.Status.RECONNECT
+    ) {
+      // RECONNECT is included because some adapters (e.g. Telegram) go
+      // ONLINE → RECONNECT → ONLINE without ever passing through DISCONNECT/OFFLINE.
       if (!botOfflineTimers.has(sid)) {
         botOfflineAt.set(sid, Date.now())
-        logger.info(`Bot ${sid} went offline, starting ${RECONNECT_GRACE_PERIOD}ms grace period`)
+        logger.info(`Bot ${sid} went offline (status=${bot.status}), starting ${RECONNECT_GRACE_PERIOD}ms grace period`)
         const timer = setTimeout(() => {
           botOfflineTimers.delete(sid)
           logger.warn(`Bot ${sid} confirmed offline (grace period expired)`)
         }, RECONNECT_GRACE_PERIOD)
         botOfflineTimers.set(sid, timer)
       }
-    } else if (bot.status === Universal.Status.RECONNECT) {
-      logger.info(`Bot ${sid} is reconnecting...`)
     }
   })
 
