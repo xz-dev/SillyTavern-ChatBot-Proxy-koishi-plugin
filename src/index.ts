@@ -1113,7 +1113,12 @@ export function apply(ctx: Context, config: Config) {
       })
     }
 
-    // 6. Auto-delete after delay (DB record cleaned up too, so crash recovery won't re-delete)
+    // 6. Auto-delete from platform after delay.
+    //    DB record is intentionally kept — it will be cleaned up by
+    //    sendStatusNotification() when the next notification of the same
+    //    category is sent. This ensures that if the platform delete fails
+    //    (network error, etc.), the DB record survives for retry on next
+    //    startup or next notification event.
     if (autoDeleteMs && msgIds.length) {
       setTimeout(async () => {
         const b = findBot(platform)
@@ -1121,9 +1126,6 @@ export function apply(ctx: Context, config: Config) {
         for (const id of msgIds) {
           b.deleteMessage(channelId, id).catch(() => {})
         }
-        ctx.database.remove('st_status_msgs', {
-          platform, channelId, messageId: { $in: msgIds },
-        }).catch(() => {})
       }, autoDeleteMs)
     }
   }
