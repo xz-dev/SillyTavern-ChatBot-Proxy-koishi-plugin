@@ -1091,16 +1091,16 @@ export function apply(ctx: Context, config: Config) {
       platform, channelId, category: { $in: cats },
     })
 
-    // 2. Delete old platform messages (best-effort)
+    // 2. Delete old platform messages; only remove DB record on success.
+    //    If platform delete fails (network error), DB record is kept
+    //    so the next notification can retry cleanup.
     for (const old of oldMsgs) {
-      bot.deleteMessage(channelId, old.messageId).catch(() => {})
-    }
-
-    // 3. Remove old DB records
-    if (oldMsgs.length) {
-      await ctx.database.remove('st_status_msgs', {
-        platform, channelId, category: { $in: cats },
-      })
+      try {
+        await bot.deleteMessage(channelId, old.messageId)
+        await ctx.database.remove('st_status_msgs', { id: old.id })
+      } catch {
+        // Platform delete failed — keep DB record for retry next time
+      }
     }
 
     // 4. Send new muted notification
